@@ -1,6 +1,0 @@
-git add .
-git commit -m "X"
-git push
-
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-. .\.venv\Scripts\Activate.ps1

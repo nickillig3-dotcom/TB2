@@ -35,3 +35,5 @@ Thumbs.db
 *.db
 wichtigebefehle
 __pycache__
+data/
+logs/

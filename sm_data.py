@@ -196,7 +196,8 @@ class DownloadConfig:
     request_timeout_ms: int = 30_000
     enable_rate_limit: bool = True
     verbose: bool = True
-
+    require_full_history: bool = True
+    history_tolerance_bars: int = 2
 
 # -----------------------------
 # Small helpers
@@ -400,7 +401,55 @@ def select_top_perp_markets(ex: Any, cfg: DownloadConfig) -> List[str]:
         raise RuntimeError("Could not rank markets by volume; ticker fields missing/unexpected.")
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-    top_ranked = ranked[: cfg.top_n]
+
+    # Optional: require history coverage for the requested lookback window.
+    if cfg.require_full_history and cfg.years > 0:
+        start_ms = to_ms(subtract_years_safe(utc_now(), cfg.years))
+        tf_ms = timeframe_to_ms(cfg.timeframe)
+        tolerance_ms = tf_ms * int(cfg.history_tolerance_bars)
+        logger.info(
+            "Filtering by history coverage: years=%d timeframe=%s tolerance_bars=%d",
+            cfg.years, cfg.timeframe, cfg.history_tolerance_bars
+        )
+
+        selected: List[Tuple[str, float]] = []
+        for s, vol in ranked:
+            if len(selected) >= cfg.top_n:
+                break
+
+            def _probe() -> List[List[float]]:
+                return ex.fetch_ohlcv(s, timeframe=cfg.timeframe, since=start_ms, limit=2)
+
+            try:
+                candles = retry_call(
+                    _probe,
+                    max_retries=cfg.max_retries,
+                    base_sleep_s=cfg.retry_base_sleep_s,
+                    max_sleep_s=cfg.retry_max_sleep_s,
+                    jitter_s=cfg.jitter_s,
+                    what=f"probe_ohlcv({s})",
+                )
+            except Exception:
+                continue
+
+            if not candles:
+                continue
+            first_ts = int(candles[0][0])
+            if first_ts <= start_ms + tolerance_ms:
+                selected.append((s, vol))
+
+        if selected:
+            top_ranked = selected
+            if len(top_ranked) < cfg.top_n:
+                logger.warning(
+                    "Only %d symbols have >=%d years history at timeframe %s (need %d).",
+                    len(top_ranked), cfg.years, cfg.timeframe, cfg.top_n
+                )
+        else:
+            logger.warning("No symbols passed full-history filter; falling back to volume-only selection.")
+            top_ranked = ranked[: cfg.top_n]
+    else:
+        top_ranked = ranked[: cfg.top_n]
     top = [s for s, _ in top_ranked]
 
     logger.info("Selected top-%d markets by volume:", cfg.top_n)
@@ -869,6 +918,7 @@ def parse_args() -> argparse.Namespace:
     p_dl.add_argument("--compression", default="zstd", help="Parquet compression (default: zstd)")
     p_dl.add_argument("--dry-run", action="store_true", help="Only select markets and print plan (no downloads)")
     p_dl.add_argument("--quiet", action="store_true", help="Less console output")
+    p_dl.add_argument("--allow-short-history", action="store_true", help="Do not require full history coverage for selection")
 
     p_val = sub.add_parser("validate", help="Validate stored datasets for duplicates/gaps.")
     p_val.add_argument("--exchange", default="binanceusdm", help="CCXT exchange id (default: binanceusdm)")
@@ -902,6 +952,7 @@ def main() -> int:
             what=tuple([w.strip().lower() for w in str(args.what).split(",") if w.strip()]),
             compression=args.compression,
             verbose=verbose,
+            require_full_history=not bool(args.allow_short_history),
         )
 
         ex = init_exchange(cfg)
@@ -967,6 +1018,7 @@ def main() -> int:
             top_n=int(args.top_n),
             quote=args.quote,
             verbose=verbose,
+            require_full_history=False,
         )
 
         ex = init_exchange(cfg)

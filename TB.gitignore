@@ -1,0 +1,33 @@
+# TB2 Python project - gitignore
+
+# --- Python bytecode / cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual environments ---
+.venv/
+venv/
+
+# --- Environment / secrets ---
+.env
+.env.*
+*.env.local
+
+# --- Logs & temp files ---
+*.log
+*.tmp
+*.temp
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.iml
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+
+# --- Local databases / caches (keine großen Binaries im Repo) ---
+*.sqlite3
+*.db

@@ -1,0 +1,8 @@
+{
+  "dataset": "ohlcv",
+  "exchange_id": "binanceusdm",
+  "last_timestamp_ms": 1765303200000,
+  "symbol": "BTC/USDT:USDT",
+  "timeframe": "1h",
+  "updated_at_utc": "2025-12-09T18:09:26.267441+00:00"
+}

@@ -31,3 +31,4 @@ Thumbs.db
 # --- Local databases / caches (keine großen Binaries im Repo) ---
 *.sqlite3
 *.db
+wichtigebefehle

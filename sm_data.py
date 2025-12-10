@@ -211,7 +211,14 @@ def sanitize_symbol(symbol: str) -> str:
         .replace("-", "_")
         .replace("__", "_")
     )
-
+def has_any_parquet(base_dir: Path) -> bool:
+    if not base_dir.exists():
+        return False
+    try:
+        next(base_dir.rglob("*.parquet"))
+        return True
+    except StopIteration:
+        return False
 
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -552,6 +559,9 @@ def download_ohlcv(
 
     # Resume if state exists
     resume = read_resume_since_ms(state_path)
+    if resume is not None and not has_any_parquet(out_dir):
+        logger.warning("State exists but OHLCV parquet missing/empty at %s -> ignoring state", out_dir)
+        resume = None
     if resume is not None and resume >= start_ms:
         since = resume + tf_ms  # continue after last candle
         logger.info("Resume OHLCV %s from %s", symbol, ms_to_utc_iso(since))
@@ -688,6 +698,10 @@ def download_funding(
 
     since = start_ms
     resume = read_resume_since_ms(state_path)
+    if resume is not None and not has_any_parquet(out_dir):
+        logger.warning("State exists but FUNDING parquet missing/empty at %s -> ignoring state", out_dir)
+        resume = None
+
     # Funding timestamps are not uniform across exchanges; still safe to resume by +1ms
     if resume is not None and resume >= start_ms:
         since = resume + 1
@@ -705,21 +719,39 @@ def download_funding(
         nonlocal rows_buffer, part_counter, total_rows
         if not rows_buffer:
             return
-        df = pl.DataFrame(rows_buffer)
-        # Normalize types
-        if "timestamp_ms" not in df.columns:
-            raise RuntimeError("Funding buffer missing timestamp_ms column.")
+        # Build strict-schema DF only from timestamp_ms + funding_rate (ignore any other keys)
+        ts_list = []
+        fr_list = []
+        for r in rows_buffer:
+            t = r.get("timestamp_ms")
+            if t is None:
+                continue
+            ts_list.append(int(t))
+
+            x = r.get("funding_rate")
+            try:
+                fr_list.append(float(x) if x is not None else None)
+            except Exception:
+                fr_list.append(None)
+
+        if not ts_list:
+            rows_buffer.clear()
+            return
+
         df = (
-            df.with_columns(pl.col("timestamp_ms").cast(pl.Int64))
-            .sort("timestamp_ms")
+            pl.DataFrame(
+                {"timestamp_ms": ts_list, "funding_rate": fr_list},
+                schema={"timestamp_ms": pl.Int64, "funding_rate": pl.Float64},
+            )
             .unique(subset=["timestamp_ms"], keep="last")
+            .sort("timestamp_ms")
         )
-        df = df.with_columns(
-            [
-                (pl.from_epoch(pl.col("timestamp_ms") / 1000, time_unit="s").dt.year()).alias("year"),
-                (pl.from_epoch(pl.col("timestamp_ms") / 1000, time_unit="s").dt.month()).alias("month"),
-            ]
-        )
+
+        df = df.with_columns([
+            pl.from_epoch("timestamp_ms", time_unit="ms").dt.year().alias("year"),
+            pl.from_epoch("timestamp_ms", time_unit="ms").dt.month().alias("month"),
+        ])
+
         last_ts = int(df["timestamp_ms"].max())
         basename = f"funding-part-{part_counter:05d}-{{i}}-{uuid.uuid4().hex}.parquet"
         write_partitioned_parquet(

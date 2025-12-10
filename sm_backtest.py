@@ -345,15 +345,18 @@ def load_funding_for_symbols(
     symbols: Sequence[str],
     ts_common: np.ndarray,
 ) -> Optional[np.ndarray]:
-    """
-    Returns funding_rate matrix (T, N) aligned to ts_common (open timestamps).
-    Funding is applied only at exact timestamps present in the funding dataset.
-    If no funding datasets exist -> returns None.
-    """
     logger = logging.getLogger("funding")
     T = int(ts_common.size)
     N = int(len(symbols))
     funding = np.zeros((T, N), dtype=np.float64)
+
+    # derive candle grid size from ts_common (e.g. 1h -> 3600000)
+    if T >= 2:
+        bar_ms = int(np.median(np.diff(ts_common.astype(np.int64))))
+        if bar_ms <= 0:
+            bar_ms = 3_600_000
+    else:
+        bar_ms = 3_600_000
 
     any_found = False
     for j, sym in enumerate(symbols):
@@ -376,11 +379,22 @@ def load_funding_for_symbols(
         f_ts = df["timestamp_ms"].to_numpy().astype(np.int64, copy=False)
         f_rt = df["funding_rate"].to_numpy().astype(np.float64, copy=False)
 
-        idx = np.searchsorted(ts_common, f_ts)
-        mask = (idx >= 0) & (idx < T) & (ts_common[idx] == f_ts) & np.isfinite(f_rt)
+        # Align funding timestamps to the candle open grid (fix ms offsets like ...0007)
+        f_ts_aligned = (f_ts // bar_ms) * bar_ms
+
+        idx = np.searchsorted(ts_common, f_ts_aligned)
+        valid = idx < T
+
+        ts_match = np.zeros_like(valid, dtype=bool)
+        if np.any(valid):
+            ts_match[valid] = (ts_common[idx[valid]] == f_ts_aligned[valid])
+
+        mask = valid & ts_match & np.isfinite(f_rt)
+
         if np.any(mask):
             funding[idx[mask], j] = f_rt[mask]
-        logger.info("%s: funding events matched=%d", sym, int(mask.sum()))
+
+        logger.info("%s: funding events matched=%d/%d (grid=%dms)", sym, int(mask.sum()), int(f_ts.size), bar_ms)
 
     if not any_found:
         logger.warning("No funding datasets found under data/parquet/%s/funding/...", exchange_id)
@@ -594,7 +608,8 @@ def run_backtest(
     if funding_rate is not None:
         if funding_rate.shape != (T, N):
             raise ValueError(f"funding_rate shape {funding_rate.shape} != (T,N)=({T},{N})")
-        funding_pnl = -np.sum(pos * funding_rate, axis=1)  # + if shorts receive positive funding
+        # Funding applies to the position held *into* the funding timestamp
+        funding_pnl = -np.sum(pos_prev * funding_rate, axis=1)
     else:
         funding_pnl = np.zeros(T, dtype=np.float64)
 

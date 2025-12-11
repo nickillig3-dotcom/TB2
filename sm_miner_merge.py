@@ -1,13 +1,13 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
-import sys
 
 import polars as pl
 
 
 RUNS_DIR = Path("reports") / "miner_runs"
-OUT_PATH = Path("reports") / "miner_global.parquet"
+OUT_ALL = Path("reports") / "miner_global.parquet"
+OUT_HOF = Path("reports") / "miner_hof.parquet"
 
 
 def main() -> int:
@@ -42,29 +42,27 @@ def main() -> int:
         return 1
 
     all_df = pl.concat(dfs, how="diagonal_relaxed")
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    all_df.write_parquet(OUT_PATH)
 
-    print(f"[merge] Wrote {OUT_PATH} | rows={all_df.height} | cols={len(all_df.columns)}")
-
-    # Kurzer Top-Preview
+    # === NaN/Null in Holdout rausfiltern ===
     cols = set(all_df.columns)
+    if "holdout_equity_end" in cols:
+        all_df = all_df.filter(
+            pl.col("holdout_equity_end").is_not_null()
+            & ~pl.col("holdout_equity_end").is_nan()
+        )
+
+    all_df.write_parquet(OUT_ALL)
+    print(f"[merge] Wrote {OUT_ALL} | rows={all_df.height} | cols={len(all_df.columns)}")
+
+    # === Global Top 20 ===
+    sort_col = "score_final" if "score_final" in cols else (
+        "score_train" if "score_train" in cols else None
+    )
 
     df_top = all_df
-
-    if "holdout_equity_end" in cols:
-        df_top = df_top.filter(pl.col("holdout_equity_end").is_not_null())
-
-    sort_col = None
-    if "score_final" in cols:
-        sort_col = "score_final"
-    elif "score_train" in cols:
-        sort_col = "score_train"
-
     if sort_col is not None:
         df_top = df_top.sort(sort_col, descending=True)
 
-    # sinnvolle Spalten für Preview
     preview_cols = [
         "fast",
         "slow",
@@ -79,9 +77,39 @@ def main() -> int:
     ]
     preview_cols = [c for c in preview_cols if c in df_top.columns]
 
-    df_top = df_top.select(preview_cols).head(20)
     print("[merge] Top 20 Kandidaten (global):")
-    print(df_top)
+    print(df_top.select(preview_cols).head(20))
+
+    # === Hall of Fame Filter ===
+    if not {"holdout_equity_end", "holdout_sharpe", "holdout_max_dd", "test_pos_folds"}.issubset(
+        all_df.columns
+    ):
+        print("[hof] Nicht alle benötigten Spalten vorhanden, überspringe HoF.")
+        return 0
+
+    hof = (
+        all_df
+        .filter(
+            (pl.col("holdout_equity_end") > 1.10)    # > +10 % im Holdout
+            & (pl.col("holdout_sharpe") > 0.4)      # vernünftige Sharpe im Holdout
+            & (pl.col("holdout_max_dd") > -0.60)    # kein >60 % Drawdown im Holdout
+            & (pl.col("test_pos_folds") >= 0.66)    # >= 2/3 der WF-Folds positiv
+        )
+    )
+
+    if hof.is_empty():
+        print("[hof] Keine Kandidaten erfüllen den Hall-of-Fame-Filter.")
+        return 0
+
+    hof = hof.sort("score_final", descending=True)
+    hof.write_parquet(OUT_HOF)
+
+    print(f"[hof] Wrote {OUT_HOF} | rows={hof.height}")
+    print("[hof] Top 10 Hall-of-Fame-Kandidaten:")
+    print(
+        hof.select(preview_cols)
+           .head(10)
+    )
 
     return 0
 

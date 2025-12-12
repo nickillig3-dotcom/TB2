@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from engine_backtest import run_backtest
 from engine_config import EngineConfig
 from engine_cv import CvPlan, build_cv_plan
 from engine_data import DataSet, make_synthetic_dataset
-from engine_metrics import compute_metrics
+from engine_executor import execute_tasks
 from engine_persistence import SQLitePersistence
-from engine_strategy import StrategySpec, build_strategy, generate_candidates
+from engine_strategy import StrategySpec, generate_candidates
+from engine_tasks import (
+    FoldEvalTask,
+    HoldoutEvalTask,
+    eval_fold_task,
+    eval_holdout_task,
+    init_eval_context,
+)
 from utils_core import canonical_json, compute_code_hash, set_global_seed
 
 
@@ -35,12 +40,13 @@ def _agg(values: List[float], method: str) -> float:
 
 
 def run_experiment(cfg: EngineConfig) -> int:
-    """Run a research loop defined by config, persist all results, return experiment_id."""
+    """Run research loop (CV + holdout) and persist results."""
     set_global_seed(cfg.seed)
 
     db = SQLitePersistence(cfg.persistence.db_path)
     code_hash = compute_code_hash(".")
     cfg_json = canonical_json(cfg)
+
     exp_id = db.create_experiment(
         run_name=cfg.run_name,
         mode=cfg.mode,
@@ -52,165 +58,226 @@ def run_experiment(cfg: EngineConfig) -> int:
     ds = _load_dataset(cfg)
     plan: CvPlan = build_cv_plan(ds, cfg.splits, cfg.cv)
 
+    # Store experiment-level meta once (avoid duplicating CV plan per strategy)
+    meta_run_id = db.start_run(
+        experiment_id=exp_id,
+        split="meta",
+        fold=None,
+        strategy_name="__experiment__",
+        strategy_json="{}",
+        strategy_hash="__experiment__",
+    )
+    db.finish_run(
+        meta_run_id,
+        status="ok",
+        metrics={
+            "n_rows": float(len(ds.frame)),
+            "n_folds": float(len(plan.folds)),
+            "has_holdout": float(1.0 if plan.holdout_test is not None else 0.0),
+        },
+        elapsed_ms=0,
+        artifacts={"cv_plan_meta": plan.meta},
+    )
+
+    # Candidate generation
     rng = np.random.default_rng(cfg.seed)
     candidates = list(generate_candidates(cfg.research, cfg.data.n_features, rng))
 
-    sel_metric = cfg.research.selection_metric
+    # Build shared evaluation context (fold data) and initialize in main process
+    fold_frames: List[Tuple[Any, Any]] = [(f.train.frame, f.valid.frame) for f in plan.folds]
+    context = {
+        "folds": fold_frames,
+        "holdout_train": plan.holdout_train.frame,
+        "holdout_test": None if plan.holdout_test is None else plan.holdout_test.frame,
+    }
+    init_eval_context(context)
 
-    # Cache spec per hash for later holdout evaluation
+    # Prepare fold tasks (strategy x fold)
+    fold_tasks: List[FoldEvalTask] = []
     spec_by_hash: Dict[str, StrategySpec] = {}
-
-    ranking: List[dict[str, Any]] = []
+    json_by_hash: Dict[str, str] = {}
 
     for spec in candidates:
-        strategy_hash = spec.spec_hash()
-        spec_by_hash[strategy_hash] = spec
-
-        valid_vals: List[float] = []
-        train_vals: List[float] = []
-        fold_metrics_compact: List[Dict[str, Any]] = []
-
+        sh = spec.spec_hash()
+        spec_json = canonical_json(spec)
+        spec_by_hash[sh] = spec
+        json_by_hash[sh] = spec_json
         for fold in plan.folds:
-            # Per-fold instance: future-proof for fit() state
-            strat = build_strategy(spec).fit(fold.train.frame)
-
-            train_metric_val = float("nan")
-
-            # 1) Train slice (diagnostics)
-            t0 = time.perf_counter()
-            run_id = db.start_run(
-                experiment_id=exp_id,
-                split="train",
-                fold=fold.fold,
-                strategy_name=spec.name,
-                strategy_json=canonical_json(spec),
-                strategy_hash=strategy_hash,
+            fold_tasks.append(
+                FoldEvalTask(
+                    task_id=f"{sh}:{fold.fold}",
+                    fold=fold.fold,
+                    strategy_spec=spec,
+                    strategy_hash=sh,
+                    strategy_json=spec_json,
+                    backtest_cfg=cfg.backtest,
+                    cost_cfg=cfg.costs,
+                )
             )
-            try:
-                raw_pos_train = strat.generate_positions(fold.train.frame)
-                bt_train = run_backtest(fold.train.frame, raw_pos_train, cfg.backtest, cfg.costs)
-                m_train = compute_metrics(bt_train)
-                train_metric_val = float(m_train.get(sel_metric, float("nan")))
 
-                elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                db.finish_run(
-                    run_id,
-                    status="ok",
-                    metrics=m_train,
-                    elapsed_ms=elapsed_ms,
-                    artifacts=None,
-                )
-                train_vals.append(train_metric_val)
-            except Exception as e:
-                elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                db.finish_run(run_id, status="error", metrics={}, elapsed_ms=elapsed_ms, error=repr(e), artifacts=None)
+    fold_results, exec_stats = execute_tasks(
+        eval_fold_task,
+        fold_tasks,
+        cfg.execution,
+        process_initializer=init_eval_context,
+        process_initargs=(context,),
+    )
 
-            # 2) Valid slice (selection / OOS within folds)
-            t1 = time.perf_counter()
-            run_id2 = db.start_run(
-                experiment_id=exp_id,
-                split="valid",
-                fold=fold.fold,
-                strategy_name=spec.name,
-                strategy_json=canonical_json(spec),
-                strategy_hash=strategy_hash,
-            )
-            try:
-                raw_pos_valid = strat.generate_positions(fold.valid.frame)
-                bt_valid = run_backtest(fold.valid.frame, raw_pos_valid, cfg.backtest, cfg.costs)
-                m_valid = compute_metrics(bt_valid)
-                v = float(m_valid.get(sel_metric, float("nan")))
+    # Store execution stats once (verifies parallel mode + fallbacks)
+    exec_run_id = db.start_run(
+        experiment_id=exp_id,
+        split="exec",
+        fold=None,
+        strategy_name="__experiment__",
+        strategy_json="{}",
+        strategy_hash="__experiment__",
+    )
+    db.finish_run(
+        exec_run_id,
+        status="ok",
+        metrics={
+            "exec_n_tasks": float(exec_stats.n_tasks),
+            "exec_n_jobs": float(exec_stats.n_jobs),
+            "exec_had_fallback": float(1.0 if exec_stats.had_fallback else 0.0),
+        },
+        elapsed_ms=0,
+        artifacts={
+            "exec_stats": {
+                "mode": exec_stats.mode,
+                "n_jobs": exec_stats.n_jobs,
+                "n_tasks": exec_stats.n_tasks,
+                "had_fallback": exec_stats.had_fallback,
+                "fallback_reason": exec_stats.fallback_reason,
+            }
+        },
+    )
 
-                elapsed_ms = int((time.perf_counter() - t1) * 1000)
-                db.finish_run(
-                    run_id2,
-                    status="ok",
-                    metrics=m_valid,
-                    elapsed_ms=elapsed_ms,
-                    artifacts={
-                        "equity_curve_head": {
-                            "t0": str(fold.valid.frame.index[0]),
-                            "t1": str(fold.valid.frame.index[-1]),
-                            "equity_end": float(bt_valid.equity_curve.iloc[-1]),
-                            "equity_head": bt_valid.equity_curve.iloc[: min(50, len(bt_valid.equity_curve))].to_list(),
-                        }
-                    },
-                )
+    # Persist fold runs + accumulate per-strategy fold metrics
+    sel_metric = cfg.research.selection_metric
+    n_folds = len(plan.folds)
 
-                valid_vals.append(v)
+    per_strategy_valid_vals: Dict[str, List[float]] = {sh: [] for sh in spec_by_hash.keys()}
+    per_strategy_fold_compact: Dict[str, List[Dict[str, Any]]] = {sh: [] for sh in spec_by_hash.keys()}
 
-                fold_metrics_compact.append(
-                    {
-                        "fold": fold.fold,
-                        "train_n": int(len(fold.train.frame)),
-                        "valid_n": int(len(fold.valid.frame)),
-                        "valid_metric": v,
-                        "train_metric": train_metric_val,
-                    }
-                )
-            except Exception as e:
-                elapsed_ms = int((time.perf_counter() - t1) * 1000)
-                db.finish_run(run_id2, status="error", metrics={}, elapsed_ms=elapsed_ms, error=repr(e), artifacts=None)
+    for res in fold_results:
+        sh = res["strategy_hash"]
+        fold_id = int(res["fold"])
+        spec_name = res["strategy_name"]
+        spec_json = res["strategy_json"]
 
-        # Aggregate CV score
-        total_folds = len(plan.folds)
-        valid_vals_clean = [x for x in valid_vals if np.isfinite(x)]
-        n_valid_ok = len(valid_vals_clean)
-        complete = (n_valid_ok == total_folds)
+        # Train persist
+        train = res["train"]
+        run_id_train = db.start_run(
+            experiment_id=exp_id,
+            split="train",
+            fold=fold_id,
+            strategy_name=spec_name,
+            strategy_json=spec_json,
+            strategy_hash=sh,
+        )
+        db.finish_run(
+            run_id_train,
+            status=str(train.get("status", "error")),
+            error=train.get("error"),
+            metrics=train.get("metrics", {}),
+            elapsed_ms=int(train.get("elapsed_ms", 0)),
+            artifacts=None,
+        )
+
+        # Valid persist
+        valid = res["valid"]
+        run_id_valid = db.start_run(
+            experiment_id=exp_id,
+            split="valid",
+            fold=fold_id,
+            strategy_name=spec_name,
+            strategy_json=spec_json,
+            strategy_hash=sh,
+        )
+        artifacts = None
+        if valid.get("status") == "ok" and valid.get("artifact") is not None:
+            artifacts = {"equity_curve_head": valid["artifact"]}
+
+        db.finish_run(
+            run_id_valid,
+            status=str(valid.get("status", "error")),
+            error=valid.get("error"),
+            metrics=valid.get("metrics", {}),
+            elapsed_ms=int(valid.get("elapsed_ms", 0)),
+            artifacts=artifacts,
+        )
+
+        # Aggregate fold compact
+        v_metrics = valid.get("metrics", {}) if valid.get("status") == "ok" else {}
+        t_metrics = train.get("metrics", {}) if train.get("status") == "ok" else {}
+
+        v_val = float(v_metrics.get(sel_metric, float("nan")))
+        t_val = float(t_metrics.get(sel_metric, float("nan")))
+
+        per_strategy_fold_compact[sh].append(
+            {
+                "fold": fold_id,
+                "train_n": int(res.get("train_n", 0)),
+                "valid_n": int(res.get("valid_n", 0)),
+                "train_metric": t_val,
+                "valid_metric": v_val,
+                "train_status": str(train.get("status", "error")),
+                "valid_status": str(valid.get("status", "error")),
+            }
+        )
+
+        if valid.get("status") == "ok" and np.isfinite(v_val):
+            per_strategy_valid_vals[sh].append(v_val)
+
+    # CV summary per strategy + ranking
+    ranking: List[dict[str, Any]] = []
+    for sh, spec in spec_by_hash.items():
+        vals = per_strategy_valid_vals.get(sh, [])
+        complete = (len(vals) == n_folds)
 
         cv_score = float("nan")
         valid_agg = float("nan")
         valid_std = float("nan")
         valid_min = float("nan")
 
-        if complete and n_valid_ok > 0:
-            valid_arr = np.asarray(valid_vals_clean, dtype=float)
-            valid_agg = _agg(valid_vals_clean, cfg.research.cv_agg)
-            valid_std = float(np.std(valid_arr, ddof=1)) if valid_arr.size > 1 else 0.0
-            valid_min = float(np.min(valid_arr))
+        if complete and len(vals) > 0:
+            arr = np.asarray(vals, dtype=float)
+            valid_agg = _agg(vals, cfg.research.cv_agg)
+            valid_std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+            valid_min = float(np.min(arr))
             cv_score = float(valid_agg - float(cfg.research.cv_penalty_std) * valid_std)
 
-        # store CV summary as its own run row (split='cv')
-        t2 = time.perf_counter()
         cv_run_id = db.start_run(
             experiment_id=exp_id,
             split="cv",
             fold=None,
             strategy_name=spec.name,
-            strategy_json=canonical_json(spec),
-            strategy_hash=strategy_hash,
+            strategy_json=json_by_hash[sh],
+            strategy_hash=sh,
         )
-        elapsed_ms = int((time.perf_counter() - t2) * 1000)
-
-        status = "ok" if np.isfinite(cv_score) else "error"
-        error = None if status == "ok" else f"incomplete_valid_folds ok={n_valid_ok} total={total_folds}"
-
         db.finish_run(
             cv_run_id,
-            status=status,
-            error=error,
+            status="ok" if np.isfinite(cv_score) else "error",
+            error=None if np.isfinite(cv_score) else f"incomplete_valid_folds ok={len(vals)} total={n_folds}",
             metrics={
                 "cv_score": float(cv_score) if np.isfinite(cv_score) else float("nan"),
                 "cv_complete": float(1.0 if complete else 0.0),
-                "cv_n_folds_ok": float(n_valid_ok),
-                "cv_n_folds_total": float(total_folds),
+                "cv_n_folds_ok": float(len(vals)),
+                "cv_n_folds_total": float(n_folds),
                 f"{sel_metric}_valid_{cfg.research.cv_agg}": float(valid_agg),
                 f"{sel_metric}_valid_std": float(valid_std),
                 f"{sel_metric}_valid_min": float(valid_min),
             },
-            elapsed_ms=elapsed_ms,
-            artifacts={
-                "cv_plan_meta": plan.meta,
-                "cv_folds_compact": fold_metrics_compact,
-            },
+            elapsed_ms=0,
+            artifacts={"cv_folds_compact": per_strategy_fold_compact.get(sh, [])},
         )
 
         if np.isfinite(cv_score):
             ranking.append(
                 {
-                    "strategy_hash": strategy_hash,
+                    "strategy_hash": sh,
                     "strategy_name": spec.name,
-                    "strategy_json": canonical_json(spec),
+                    "strategy_json": json_by_hash[sh],
                     "score_value": cv_score,
                 }
             )
@@ -220,46 +287,59 @@ def run_experiment(cfg: EngineConfig) -> int:
     best = ranking[:top_k]
     db.store_best_candidates(exp_id, ranked=best, score_key="cv_score")
 
-    # Final untouched holdout evaluation for top candidates
+    # Holdout test for best candidates
     if plan.holdout_test is not None and len(best) > 0:
+        holdout_tasks: List[HoldoutEvalTask] = []
         for row in best:
             sh = row["strategy_hash"]
             spec = spec_by_hash.get(sh)
             if spec is None:
                 continue
-            strat = build_strategy(spec).fit(plan.holdout_train.frame)
+            holdout_tasks.append(
+                HoldoutEvalTask(
+                    task_id=f"{sh}:holdout",
+                    strategy_spec=spec,
+                    strategy_hash=sh,
+                    strategy_json=json_by_hash[sh],
+                    backtest_cfg=cfg.backtest,
+                    cost_cfg=cfg.costs,
+                )
+            )
 
-            t3 = time.perf_counter()
-            test_run_id = db.start_run(
+        holdout_results, _ = execute_tasks(
+            eval_holdout_task,
+            holdout_tasks,
+            cfg.execution,
+            process_initializer=init_eval_context,
+            process_initargs=(context,),
+        )
+
+        for res in holdout_results:
+            sh = res["strategy_hash"]
+            spec_name = res["strategy_name"]
+            spec_json = res["strategy_json"]
+            test = res["test"]
+
+            run_id_test = db.start_run(
                 experiment_id=exp_id,
                 split="test",
                 fold=None,
-                strategy_name=spec.name,
-                strategy_json=canonical_json(spec),
+                strategy_name=spec_name,
+                strategy_json=spec_json,
                 strategy_hash=sh,
             )
-            try:
-                raw_pos_test = strat.generate_positions(plan.holdout_test.frame)
-                bt_test = run_backtest(plan.holdout_test.frame, raw_pos_test, cfg.backtest, cfg.costs)
-                m_test = compute_metrics(bt_test)
-                elapsed_ms = int((time.perf_counter() - t3) * 1000)
-                db.finish_run(
-                    test_run_id,
-                    status="ok",
-                    metrics=m_test,
-                    elapsed_ms=elapsed_ms,
-                    artifacts={
-                        "equity_curve_head": {
-                            "t0": str(plan.holdout_test.frame.index[0]),
-                            "t1": str(plan.holdout_test.frame.index[-1]),
-                            "equity_end": float(bt_test.equity_curve.iloc[-1]),
-                            "equity_head": bt_test.equity_curve.iloc[: min(50, len(bt_test.equity_curve))].to_list(),
-                        }
-                    },
-                )
-            except Exception as e:
-                elapsed_ms = int((time.perf_counter() - t3) * 1000)
-                db.finish_run(test_run_id, status="error", metrics={}, elapsed_ms=elapsed_ms, error=repr(e), artifacts=None)
+            artifacts = None
+            if test.get("status") == "ok" and test.get("artifact") is not None:
+                artifacts = {"equity_curve_head": test["artifact"]}
+
+            db.finish_run(
+                run_id_test,
+                status=str(test.get("status", "error")),
+                error=test.get("error"),
+                metrics=test.get("metrics", {}),
+                elapsed_ms=int(test.get("elapsed_ms", 0)),
+                artifacts=artifacts,
+            )
 
     db.close()
     return exp_id

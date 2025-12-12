@@ -495,3 +495,57 @@ class SQLitePersistence:
 
         row = cur.fetchone()
         return None if row is None else {"run_id": int(row["run_id"]), "experiment_id": int(row["experiment_id"])}
+    def cache_diagnostics(
+        self,
+        evaluation_hash: str,
+        code_hash: str,
+        exclude_experiment_id: int,
+    ) -> dict[str, Any]:
+        """
+        Quick diagnostics to explain cache hits/misses.
+        - same_eval_experiments: prior experiments with same evaluation_hash
+        - same_eval_code_experiments: prior experiments with same evaluation_hash AND code_hash
+        """
+        cur = self.conn.cursor()
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM experiments
+            WHERE evaluation_hash = ?
+              AND experiment_id != ?
+            """,
+            (str(evaluation_hash), int(exclude_experiment_id)),
+        )
+        same_eval = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM experiments
+            WHERE evaluation_hash = ?
+              AND code_hash = ?
+              AND experiment_id != ?
+            """,
+            (str(evaluation_hash), str(code_hash), int(exclude_experiment_id)),
+        )
+        same_eval_code = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            SELECT MAX(experiment_id) AS max_id
+            FROM experiments
+            WHERE evaluation_hash = ?
+              AND code_hash = ?
+              AND experiment_id != ?
+            """,
+            (str(evaluation_hash), str(code_hash), int(exclude_experiment_id)),
+        )
+        row = cur.fetchone()
+        latest_same_eval_code = None if row is None or row["max_id"] is None else int(row["max_id"])
+
+        return {
+            "same_eval_experiments": same_eval,
+            "same_eval_code_experiments": same_eval_code,
+            "latest_same_eval_code_experiment_id": latest_same_eval_code,
+        }

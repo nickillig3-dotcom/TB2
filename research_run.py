@@ -48,6 +48,25 @@ def main(argv: list[str] | None = None) -> int:
 
         if f_total is not None:
             print(f"Cache: fold_skipped={f_skip}/{f_total} | test_skipped={t_skip}/{t_total} | unique_candidates={c_uni}/{c_gen}")
+
+        # Cache diagnostics (why did we compute vs reuse?)
+        cache_key = exec_stats.get("cache_key") if isinstance(exec_stats.get("cache_key"), dict) else {}
+        eval_h = cache_key.get("evaluation_hash")
+        code_h = cache_key.get("code_hash")
+        if isinstance(eval_h, str) and isinstance(code_h, str):
+            diag = db.cache_diagnostics(eval_h, code_h, exclude_experiment_id=exp_id)
+            print(
+                "CacheDiag:"
+                f" same_eval_experiments={diag.get('same_eval_experiments')}"
+                f" same_eval_code_experiments={diag.get('same_eval_code_experiments')}"
+                f" latest_same_eval_code_experiment_id={diag.get('latest_same_eval_code_experiment_id')}"
+            )
+            # Human hint
+            if (diag.get("same_eval_experiments", 0) > 0) and (diag.get("same_eval_code_experiments", 0) == 0):
+                print("CacheHint: gleiche Evaluation existiert, aber code_hash anders -> Recompute nach Code-Änderung ist erwartbar.")
+            elif (diag.get("same_eval_code_experiments", 0) == 0):
+                print("CacheHint: cold cache für diese eval_hash+code_hash Kombi (erster Run). Re-run => volle Cache-Hits.")
+
     else:
         print("Executor: (no exec_stats found)")
 

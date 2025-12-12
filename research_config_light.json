@@ -1,0 +1,41 @@
+{
+  "run_name": "smoke_light",
+  "mode": "light",
+  "seed": 42,
+  "data": {
+    "type": "synthetic",
+    "n_rows": 400,
+    "n_features": 6,
+    "freq": "D",
+    "start": "2018-01-01"
+  },
+  "splits": {
+    "train_frac": 0.6,
+    "valid_frac": 0.2,
+    "embargo_rows": 2,
+    "min_rows": 50
+  },
+  "research": {
+    "n_candidates": 20,
+    "generator": "linear_random_v1",
+    "top_k": 5,
+    "selection_split": "valid",
+    "selection_metric": "sharpe_net"
+  },
+  "backtest": {
+    "execution_lag": 1,
+    "leverage": 1.0
+  },
+  "costs": {
+    "tc_bps": 2.0,
+    "slippage_bps": 1.0,
+    "borrow_bps_annual": 0.0
+  },
+  "persistence": {
+    "db_path": "strategy_miner.sqlite"
+  },
+  "execution": {
+    "n_jobs": 0,
+    "prefer_processes": true
+  }
+}

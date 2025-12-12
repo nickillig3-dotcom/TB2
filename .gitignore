@@ -39,3 +39,13 @@ data/
 logs/
 reports/
 data_1y_backup_20251211/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+*.log
+.DS_Store
+.pytest_cache/
+*.ipynb_checkpoints

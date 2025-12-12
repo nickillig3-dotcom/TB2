@@ -5,6 +5,7 @@ import sqlite3
 import zlib
 from typing import Any, Dict, Optional
 
+from engine_signature import evaluation_hash_from_signature, evaluation_signature_from_config_dict
 from utils_core import canonical_json, env_fingerprint, now_utc_iso
 
 
@@ -35,6 +36,7 @@ class SQLitePersistence:
     def _create_tables(self) -> None:
         cur = self.conn.cursor()
 
+        # NOTE: evaluation_hash exists for NEW DBs; for existing DBs it's added in _migrate_schema().
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS experiments (
@@ -44,6 +46,7 @@ class SQLitePersistence:
                 mode TEXT NOT NULL,
                 config_json TEXT NOT NULL,
                 config_hash TEXT NOT NULL,
+                evaluation_hash TEXT,
                 code_hash TEXT NOT NULL,
                 python TEXT NOT NULL,
                 platform TEXT NOT NULL
@@ -131,11 +134,46 @@ class SQLitePersistence:
         """Forward-only tiny migrations for local dev."""
         cur = self.conn.cursor()
 
-        # v2: add runs.fold (nullable INTEGER) for walk-forward CV.
+        # v2: add runs.fold (nullable)
         if not self._column_exists("runs", "fold"):
             cur.execute("ALTER TABLE runs ADD COLUMN fold INTEGER;")
 
+        # v3: add experiments.evaluation_hash (nullable)
+        if not self._column_exists("experiments", "evaluation_hash"):
+            cur.execute("ALTER TABLE experiments ADD COLUMN evaluation_hash TEXT;")
+
+        # Index for evaluation_hash-based cache lookup
+        if self._column_exists("experiments", "evaluation_hash"):
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_experiments_eval_code ON experiments(evaluation_hash, code_hash);"
+            )
+
         self.conn.commit()
+
+        # Backfill evaluation_hash for older rows (best effort)
+        if self._column_exists("experiments", "evaluation_hash"):
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT experiment_id, config_json
+                FROM experiments
+                WHERE evaluation_hash IS NULL OR evaluation_hash = ''
+                """
+            )
+            rows = cur.fetchall()
+            if rows:
+                for r in rows:
+                    try:
+                        raw = json.loads(r["config_json"])
+                        sig = evaluation_signature_from_config_dict(raw)
+                        eh = evaluation_hash_from_signature(sig)
+                    except Exception:
+                        continue
+                    cur.execute(
+                        "UPDATE experiments SET evaluation_hash = ? WHERE experiment_id = ?",
+                        (str(eh), int(r["experiment_id"])),
+                    )
+                self.conn.commit()
 
     def create_experiment(
         self,
@@ -143,16 +181,27 @@ class SQLitePersistence:
         mode: str,
         config_json: str,
         config_hash: str,
+        evaluation_hash: str,
         code_hash: str,
     ) -> int:
         env = env_fingerprint()
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO experiments(created_at, run_name, mode, config_json, config_hash, code_hash, python, platform)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO experiments(created_at, run_name, mode, config_json, config_hash, evaluation_hash, code_hash, python, platform)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (now_utc_iso(), run_name, mode, config_json, config_hash, code_hash, env["python"], env["platform"]),
+            (
+                now_utc_iso(),
+                run_name,
+                mode,
+                config_json,
+                config_hash,
+                evaluation_hash,
+                code_hash,
+                env["python"],
+                env["platform"],
+            ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -342,7 +391,7 @@ class SQLitePersistence:
         except Exception:
             return None
 
-    # -------- Cache helpers (cross-experiment reuse) --------------------------
+    # -------- Cache helpers ---------------------------------------------------
 
     def fetch_run_metrics(self, run_id: int) -> Dict[str, float]:
         cur = self.conn.cursor()
@@ -387,7 +436,7 @@ class SQLitePersistence:
 
     def fetch_cached_run_ref(
         self,
-        config_hash: str,
+        evaluation_hash: str,
         code_hash: str,
         strategy_hash: str,
         split: str,
@@ -395,7 +444,7 @@ class SQLitePersistence:
         exclude_experiment_id: int,
     ) -> Optional[dict[str, Any]]:
         """
-        Find a previous run (different experiment) with same (config_hash, code_hash, strategy_hash, split, fold).
+        Find a previous run (different experiment) with same (evaluation_hash, code_hash, strategy_hash, split, fold).
         Returns: {"run_id": ..., "experiment_id": ...} or None.
         """
         cur = self.conn.cursor()
@@ -406,7 +455,7 @@ class SQLitePersistence:
                 SELECT r.run_id, r.experiment_id
                 FROM runs r
                 JOIN experiments e ON e.experiment_id = r.experiment_id
-                WHERE e.config_hash = ?
+                WHERE e.evaluation_hash = ?
                   AND e.code_hash = ?
                   AND r.strategy_hash = ?
                   AND r.split = ?
@@ -416,7 +465,7 @@ class SQLitePersistence:
                 ORDER BY r.run_id DESC
                 LIMIT 1
                 """,
-                (str(config_hash), str(code_hash), str(strategy_hash), str(split), int(exclude_experiment_id)),
+                (str(evaluation_hash), str(code_hash), str(strategy_hash), str(split), int(exclude_experiment_id)),
             )
         else:
             cur.execute(
@@ -424,7 +473,7 @@ class SQLitePersistence:
                 SELECT r.run_id, r.experiment_id
                 FROM runs r
                 JOIN experiments e ON e.experiment_id = r.experiment_id
-                WHERE e.config_hash = ?
+                WHERE e.evaluation_hash = ?
                   AND e.code_hash = ?
                   AND r.strategy_hash = ?
                   AND r.split = ?
@@ -434,7 +483,14 @@ class SQLitePersistence:
                 ORDER BY r.run_id DESC
                 LIMIT 1
                 """,
-                (str(config_hash), str(code_hash), str(strategy_hash), str(split), int(fold), int(exclude_experiment_id)),
+                (
+                    str(evaluation_hash),
+                    str(code_hash),
+                    str(strategy_hash),
+                    str(split),
+                    int(fold),
+                    int(exclude_experiment_id),
+                ),
             )
 
         row = cur.fetchone()

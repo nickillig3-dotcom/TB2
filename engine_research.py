@@ -9,6 +9,7 @@ from engine_cv import CvPlan, build_cv_plan
 from engine_data import DataSet, make_synthetic_dataset
 from engine_executor import execute_tasks
 from engine_persistence import SQLitePersistence
+from engine_signature import evaluation_hash_from_cfg
 from engine_strategy import StrategySpec, generate_candidates
 from engine_tasks import (
     FoldEvalTask,
@@ -47,12 +48,14 @@ def run_experiment(cfg: EngineConfig) -> int:
     code_hash = compute_code_hash(".")
     cfg_json = canonical_json(cfg)
     config_hash = cfg.config_hash()
+    evaluation_hash = evaluation_hash_from_cfg(cfg)
 
     exp_id = db.create_experiment(
         run_name=cfg.run_name,
         mode=cfg.mode,
         config_json=cfg_json,
         config_hash=config_hash,
+        evaluation_hash=evaluation_hash,
         code_hash=code_hash,
     )
 
@@ -80,7 +83,7 @@ def run_experiment(cfg: EngineConfig) -> int:
         artifacts={"cv_plan_meta": plan.meta},
     )
 
-    # Exec info (we fill at the end, but create row now so it's always present)
+    # Exec info row (filled at end)
     exec_run_id = db.start_run(
         experiment_id=exp_id,
         split="exec",
@@ -90,7 +93,7 @@ def run_experiment(cfg: EngineConfig) -> int:
         strategy_hash="__experiment__",
     )
 
-    # Candidate generation + dedup (important for future generators)
+    # Candidate generation + dedup
     rng = np.random.default_rng(cfg.seed)
     raw_candidates = list(generate_candidates(cfg.research, cfg.data.n_features, rng))
 
@@ -116,7 +119,7 @@ def run_experiment(cfg: EngineConfig) -> int:
     sel_metric = cfg.research.selection_metric
     n_folds = len(plan.folds)
 
-    # Prepare tasks with cache reuse
+    # Prepare fold tasks with cache reuse
     fold_tasks: List[FoldEvalTask] = []
     cached_fold_results: List[Dict[str, Any]] = []
 
@@ -134,9 +137,8 @@ def run_experiment(cfg: EngineConfig) -> int:
         for fold in plan.folds:
             fold_id = int(fold.fold)
 
-            # Cache lookup: if BOTH train + valid exist, skip compute
             train_ref = db.fetch_cached_run_ref(
-                config_hash=config_hash,
+                evaluation_hash=evaluation_hash,
                 code_hash=code_hash,
                 strategy_hash=sh,
                 split="train",
@@ -144,7 +146,7 @@ def run_experiment(cfg: EngineConfig) -> int:
                 exclude_experiment_id=exp_id,
             )
             valid_ref = db.fetch_cached_run_ref(
-                config_hash=config_hash,
+                evaluation_hash=evaluation_hash,
                 code_hash=code_hash,
                 strategy_hash=sh,
                 split="valid",
@@ -188,7 +190,6 @@ def run_experiment(cfg: EngineConfig) -> int:
                 cache_fold_tasks_skipped += 1
                 continue
 
-            # otherwise compute
             fold_tasks.append(
                 FoldEvalTask(
                     task_id=f"{sh}:{fold_id}",
@@ -214,7 +215,7 @@ def run_experiment(cfg: EngineConfig) -> int:
     fold_results.extend(cached_fold_results)
     fold_results.extend(fold_results_computed)
 
-    # Persist fold runs + accumulate per-strategy metrics
+    # Persist fold runs + accumulate per-strategy fold metrics
     per_strategy_valid_vals: Dict[str, List[float]] = {sh: [] for sh in spec_by_hash.keys()}
     per_strategy_fold_compact: Dict[str, List[Dict[str, Any]]] = {sh: [] for sh in spec_by_hash.keys()}
 
@@ -244,6 +245,7 @@ def run_experiment(cfg: EngineConfig) -> int:
         train_artifacts: Dict[str, Any] = {}
         if train_cached and isinstance(train.get("cache_ref"), dict):
             train_artifacts["cache_info"] = {"cached": True, **train["cache_ref"]}
+
         db.finish_run(
             run_id_train,
             status=str(train.get("status", "error")),
@@ -377,7 +379,7 @@ def run_experiment(cfg: EngineConfig) -> int:
                 continue
 
             test_ref = db.fetch_cached_run_ref(
-                config_hash=config_hash,
+                evaluation_hash=evaluation_hash,
                 code_hash=code_hash,
                 strategy_hash=sh,
                 split="test",
@@ -418,7 +420,7 @@ def run_experiment(cfg: EngineConfig) -> int:
                 )
             )
 
-        holdout_results_computed, holdout_exec_stats = execute_tasks(
+        holdout_results_computed, _ = execute_tasks(
             eval_holdout_task,
             holdout_tasks,
             cfg.execution,
@@ -463,8 +465,6 @@ def run_experiment(cfg: EngineConfig) -> int:
                 elapsed_ms=int(test.get("elapsed_ms", 0)),
                 artifacts=test_artifacts or None,
             )
-    else:
-        holdout_exec_stats = None  # noqa: F841
 
     # Finish exec stats (audit: executor + cache + dedup)
     fold_tasks_total = int(n_candidates_unique) * int(n_folds)
@@ -474,6 +474,10 @@ def run_experiment(cfg: EngineConfig) -> int:
     test_tasks_total = int(top_k) if (plan.holdout_test is not None) else 0
     test_tasks_executed = int(len(holdout_tasks))
     test_tasks_skipped = int(cache_test_tasks_skipped)
+
+    mode_display = fold_exec_stats.mode
+    if fold_tasks_total > 0 and fold_tasks_executed == 0 and fold_tasks_skipped == fold_tasks_total:
+        mode_display = "cache"
 
     db.finish_run(
         exec_run_id,
@@ -494,7 +498,7 @@ def run_experiment(cfg: EngineConfig) -> int:
         elapsed_ms=0,
         artifacts={
             "exec_stats": {
-                "mode": fold_exec_stats.mode,
+                "mode": mode_display,
                 "requested_n_jobs": int(cfg.execution.n_jobs),
                 "prefer_processes": bool(cfg.execution.prefer_processes),
                 "n_jobs_used": int(fold_exec_stats.n_jobs),
@@ -509,7 +513,11 @@ def run_experiment(cfg: EngineConfig) -> int:
                 "test_tasks_total": int(test_tasks_total),
                 "test_tasks_executed": int(test_tasks_executed),
                 "test_tasks_skipped": int(test_tasks_skipped),
-                "cache_key": {"config_hash": config_hash, "code_hash": code_hash},
+                "cache_key": {
+                    "evaluation_hash": evaluation_hash,
+                    "config_hash": config_hash,
+                    "code_hash": code_hash,
+                },
             }
         },
     )

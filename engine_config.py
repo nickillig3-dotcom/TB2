@@ -25,12 +25,45 @@ class SplitConfig:
 
 
 @dataclass(frozen=True)
+class CvConfig:
+    """Cross-validation / robustness split config.
+
+    method:
+      - "single": use SplitConfig's single train/valid/test split
+      - "walk_forward": multiple chronological folds + final holdout test
+
+    purge_rows:
+      - removes last N rows from training before each validation window
+        (purged boundary to reduce leakage risk).
+
+    holdout_test_rows:
+      - reserves final untouched OOS test slice.
+    """
+    method: str = "single"  # single|walk_forward
+    n_folds: int = 3
+
+    valid_window_rows: int = 50
+    step_rows: int = 50
+
+    min_train_rows: int = 120
+    train_window_rows: int = 0  # 0 => expanding window, else fixed rolling window
+    purge_rows: int = 2
+
+    holdout_test_rows: int = 80
+    min_valid_rows: int = 30
+
+
+@dataclass(frozen=True)
 class ResearchConfig:
     n_candidates: int = 20
     generator: str = "linear_random_v1"
     top_k: int = 5
-    selection_split: str = "valid"  # train|valid|test
-    selection_metric: str = "sharpe_net"  # metric key computed by engine_metrics
+    selection_split: str = "valid"
+    selection_metric: str = "sharpe_net"
+
+    # CV scoring: cv_score = agg(valid_metric) - penalty_std * std(valid_metric)
+    cv_agg: str = "median"  # median|mean|min
+    cv_penalty_std: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -60,11 +93,12 @@ class ExecutionConfig:
 @dataclass(frozen=True)
 class EngineConfig:
     run_name: str = "strategy_miner"
-    mode: str = "light"  # light|full (only config-level differences)
+    mode: str = "light"
     seed: int = 42
 
     data: DataConfig = DataConfig()
     splits: SplitConfig = SplitConfig()
+    cv: CvConfig = CvConfig()
     research: ResearchConfig = ResearchConfig()
     backtest: BacktestConfig = BacktestConfig()
     costs: CostConfig = CostConfig()
@@ -101,6 +135,7 @@ def load_config(path: str) -> EngineConfig:
 
     data_raw = dict(_get(raw, "data", {}))
     splits_raw = dict(_get(raw, "splits", {}))
+    cv_raw = dict(_get(raw, "cv", {}))
     research_raw = dict(_get(raw, "research", {}))
     backtest_raw = dict(_get(raw, "backtest", {}))
     costs_raw = dict(_get(raw, "costs", {}))
@@ -124,12 +159,25 @@ def load_config(path: str) -> EngineConfig:
             embargo_rows=_coerce_int(_get(splits_raw, "embargo_rows", 0), 0),
             min_rows=_coerce_int(_get(splits_raw, "min_rows", 50), 50),
         ),
+        cv=CvConfig(
+            method=str(_get(cv_raw, "method", "single")),
+            n_folds=_coerce_int(_get(cv_raw, "n_folds", 3), 3),
+            valid_window_rows=_coerce_int(_get(cv_raw, "valid_window_rows", 50), 50),
+            step_rows=_coerce_int(_get(cv_raw, "step_rows", 50), 50),
+            min_train_rows=_coerce_int(_get(cv_raw, "min_train_rows", 120), 120),
+            train_window_rows=_coerce_int(_get(cv_raw, "train_window_rows", 0), 0),
+            purge_rows=_coerce_int(_get(cv_raw, "purge_rows", 2), 2),
+            holdout_test_rows=_coerce_int(_get(cv_raw, "holdout_test_rows", 80), 80),
+            min_valid_rows=_coerce_int(_get(cv_raw, "min_valid_rows", 30), 30),
+        ),
         research=ResearchConfig(
             n_candidates=_coerce_int(_get(research_raw, "n_candidates", 20), 20),
             generator=str(_get(research_raw, "generator", "linear_random_v1")),
             top_k=_coerce_int(_get(research_raw, "top_k", 5), 5),
             selection_split=str(_get(research_raw, "selection_split", "valid")),
             selection_metric=str(_get(research_raw, "selection_metric", "sharpe_net")),
+            cv_agg=str(_get(research_raw, "cv_agg", "median")),
+            cv_penalty_std=_coerce_float(_get(research_raw, "cv_penalty_std", 0.5), 0.5),
         ),
         backtest=BacktestConfig(
             execution_lag=_coerce_int(_get(backtest_raw, "execution_lag", 1), 1),
@@ -149,7 +197,7 @@ def load_config(path: str) -> EngineConfig:
         ),
     )
 
-    # Minimal sanity checks (keep lightweight; move to richer validators later)
+    # Minimal sanity checks
     if not (0.0 < cfg.splits.train_frac < 1.0):
         raise ValueError("splits.train_frac must be in (0,1)")
     if not (0.0 <= cfg.splits.valid_frac < 1.0):
@@ -166,5 +214,25 @@ def load_config(path: str) -> EngineConfig:
         raise ValueError("data.n_features must be > 0")
     if cfg.research.top_k <= 0:
         raise ValueError("research.top_k must be > 0")
+
+    if cfg.cv.method not in {"single", "walk_forward"}:
+        raise ValueError("cv.method must be 'single' or 'walk_forward'")
+    if cfg.cv.n_folds < 1:
+        raise ValueError("cv.n_folds must be >= 1")
+    if cfg.cv.valid_window_rows < 1:
+        raise ValueError("cv.valid_window_rows must be >= 1")
+    if cfg.cv.step_rows < 1:
+        raise ValueError("cv.step_rows must be >= 1")
+    if cfg.cv.min_train_rows < 10:
+        raise ValueError("cv.min_train_rows must be >= 10")
+    if cfg.cv.purge_rows < 0:
+        raise ValueError("cv.purge_rows must be >= 0")
+    if cfg.cv.train_window_rows < 0:
+        raise ValueError("cv.train_window_rows must be >= 0")
+
+    if cfg.research.cv_agg not in {"median", "mean", "min"}:
+        raise ValueError("research.cv_agg must be one of: median|mean|min")
+    if cfg.research.cv_penalty_std < 0:
+        raise ValueError("research.cv_penalty_std must be >= 0")
 
     return cfg

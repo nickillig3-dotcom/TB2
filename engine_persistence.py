@@ -8,20 +8,15 @@ from utils_core import canonical_json, env_fingerprint, now_utc_iso
 
 
 class SQLitePersistence:
-    """Lightweight persistence layer (stdlib sqlite3) for experiment tracking.
+    """Lightweight persistence layer (stdlib sqlite3) for experiment tracking."""
 
-    Design goals:
-      - durable: results survive crashes
-      - queryable: can rank/filter later
-      - minimal deps: sqlite3 is in stdlib
-      - scalable enough: WAL mode supports concurrent writers (full-mode later)
-    """
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, timeout=60.0)
         self.conn.row_factory = sqlite3.Row
         self._apply_pragmas()
         self._create_tables()
+        self._migrate_schema()
 
     def close(self) -> None:
         try:
@@ -55,6 +50,8 @@ class SQLitePersistence:
             """
         )
 
+        # NOTE: fold column is included for NEW DBs.
+        # For older DBs we add it in _migrate_schema().
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS runs (
@@ -62,6 +59,7 @@ class SQLitePersistence:
                 experiment_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 split TEXT NOT NULL,
+                fold INTEGER,
                 strategy_name TEXT NOT NULL,
                 strategy_json TEXT NOT NULL,
                 strategy_hash TEXT NOT NULL,
@@ -121,6 +119,28 @@ class SQLitePersistence:
 
         self.conn.commit()
 
+    def _column_exists(self, table: str, column: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(f"PRAGMA table_info({table});")
+        cols = [r["name"] for r in cur.fetchall()]
+        return column in cols
+
+    def _migrate_schema(self) -> None:
+        """Forward-only tiny migrations for local dev.
+
+        v2: add runs.fold (nullable INTEGER) for walk-forward CV.
+        """
+        cur = self.conn.cursor()
+
+        if not self._column_exists("runs", "fold"):
+            cur.execute("ALTER TABLE runs ADD COLUMN fold INTEGER;")
+
+        # Only create fold index if the column exists (important for migrating older DBs).
+        if self._column_exists("runs", "fold"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_fold ON runs(experiment_id, fold);")
+
+        self.conn.commit()
+
     def create_experiment(
         self,
         run_name: str,
@@ -148,14 +168,15 @@ class SQLitePersistence:
         strategy_name: str,
         strategy_json: str,
         strategy_hash: str,
+        fold: Optional[int] = None,
     ) -> int:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO runs(experiment_id, created_at, split, strategy_name, strategy_json, strategy_hash, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runs(experiment_id, created_at, split, fold, strategy_name, strategy_json, strategy_hash, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (experiment_id, now_utc_iso(), split, strategy_name, strategy_json, strategy_hash, "running"),
+            (experiment_id, now_utc_iso(), split, fold, strategy_name, strategy_json, strategy_hash, "running"),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -208,7 +229,6 @@ class SQLitePersistence:
         ranked: list[dict[str, Any]],
         score_key: str,
     ) -> None:
-        """Persist experiment-level top-K candidates (selection is done by the runner)."""
         cur = self.conn.cursor()
         cur.execute("DELETE FROM best_candidates WHERE experiment_id = ?", (int(experiment_id),))
         now = now_utc_iso()
@@ -254,22 +274,46 @@ class SQLitePersistence:
         split: str,
         metric_key: str,
         limit: int = 10,
-        desc: bool = True,
     ) -> list[dict[str, Any]]:
-        order = "DESC" if desc else "ASC"
         cur = self.conn.cursor()
         cur.execute(
-            f"""
-            SELECT r.run_id, r.strategy_name, r.strategy_hash, m.value as metric_value, r.elapsed_ms
+            """
+            SELECT r.run_id, r.strategy_name, r.strategy_hash, r.fold, m.value AS metric
             FROM runs r
             JOIN metrics m ON m.run_id = r.run_id
             WHERE r.experiment_id = ?
               AND r.split = ?
               AND r.status = 'ok'
               AND m.key = ?
-            ORDER BY m.value {order}
+            ORDER BY m.value DESC
             LIMIT ?
             """,
             (int(experiment_id), str(split), str(metric_key), int(limit)),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def fetch_latest_metric_for_strategy(
+        self,
+        experiment_id: int,
+        strategy_hash: str,
+        split: str,
+        metric_key: str,
+    ) -> Optional[float]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT m.value AS value
+            FROM runs r
+            JOIN metrics m ON m.run_id = r.run_id
+            WHERE r.experiment_id = ?
+              AND r.strategy_hash = ?
+              AND r.split = ?
+              AND r.status = 'ok'
+              AND m.key = ?
+            ORDER BY r.run_id DESC
+            LIMIT 1
+            """,
+            (int(experiment_id), str(strategy_hash), str(split), str(metric_key)),
+        )
+        row = cur.fetchone()
+        return None if row is None else float(row["value"])

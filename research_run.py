@@ -8,7 +8,7 @@ from engine_research import run_experiment
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Strategy-Miner: research runner (walk-forward CV + holdout).")
+    p = argparse.ArgumentParser(description="Strategy-Miner: research runner (CV + holdout + exec + cache stats).")
     p.add_argument("--config", required=True, help="Path to JSON config.")
     p.add_argument("--show-top", type=int, default=10, help="Show top-N after run.")
     args = p.parse_args(argv)
@@ -20,6 +20,37 @@ def main(argv: list[str] | None = None) -> int:
     best = db.fetch_best_candidates(exp_id)
 
     print(f"experiment_id={exp_id} db={cfg.persistence.db_path}")
+
+    exec_stats = db.fetch_latest_artifact_json(
+        exp_id,
+        split="exec",
+        name="exec_stats",
+        strategy_hash="__experiment__",
+    )
+
+    if isinstance(exec_stats, dict):
+        print(
+            "Executor:"
+            f" mode={exec_stats.get('mode')}"
+            f" requested_n_jobs={exec_stats.get('requested_n_jobs')}"
+            f" used_n_jobs={exec_stats.get('n_jobs_used')}"
+            f" executed_tasks={exec_stats.get('n_tasks_executed')}"
+            f" had_fallback={exec_stats.get('had_fallback')}"
+        )
+
+        # Cache summary (if present)
+        f_total = exec_stats.get("fold_tasks_total")
+        f_skip = exec_stats.get("fold_tasks_skipped")
+        t_total = exec_stats.get("test_tasks_total")
+        t_skip = exec_stats.get("test_tasks_skipped")
+        c_gen = exec_stats.get("candidates_generated")
+        c_uni = exec_stats.get("candidates_unique")
+
+        if f_total is not None:
+            print(f"Cache: fold_skipped={f_skip}/{f_total} | test_skipped={t_skip}/{t_total} | unique_candidates={c_uni}/{c_gen}")
+    else:
+        print("Executor: (no exec_stats found)")
+
     if not best:
         print("No best candidates stored (check run logs).")
         db.close()

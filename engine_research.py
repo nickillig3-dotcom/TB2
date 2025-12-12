@@ -46,19 +46,20 @@ def run_experiment(cfg: EngineConfig) -> int:
     db = SQLitePersistence(cfg.persistence.db_path)
     code_hash = compute_code_hash(".")
     cfg_json = canonical_json(cfg)
+    config_hash = cfg.config_hash()
 
     exp_id = db.create_experiment(
         run_name=cfg.run_name,
         mode=cfg.mode,
         config_json=cfg_json,
-        config_hash=cfg.config_hash(),
+        config_hash=config_hash,
         code_hash=code_hash,
     )
 
     ds = _load_dataset(cfg)
     plan: CvPlan = build_cv_plan(ds, cfg.splits, cfg.cv)
 
-    # Store experiment-level meta once (avoid duplicating CV plan per strategy)
+    # Experiment meta (stored once)
     meta_run_id = db.start_run(
         experiment_id=exp_id,
         split="meta",
@@ -79,51 +80,7 @@ def run_experiment(cfg: EngineConfig) -> int:
         artifacts={"cv_plan_meta": plan.meta},
     )
 
-    # Candidate generation
-    rng = np.random.default_rng(cfg.seed)
-    candidates = list(generate_candidates(cfg.research, cfg.data.n_features, rng))
-
-    # Build shared evaluation context (fold data) and initialize in main process
-    fold_frames: List[Tuple[Any, Any]] = [(f.train.frame, f.valid.frame) for f in plan.folds]
-    context = {
-        "folds": fold_frames,
-        "holdout_train": plan.holdout_train.frame,
-        "holdout_test": None if plan.holdout_test is None else plan.holdout_test.frame,
-    }
-    init_eval_context(context)
-
-    # Prepare fold tasks (strategy x fold)
-    fold_tasks: List[FoldEvalTask] = []
-    spec_by_hash: Dict[str, StrategySpec] = {}
-    json_by_hash: Dict[str, str] = {}
-
-    for spec in candidates:
-        sh = spec.spec_hash()
-        spec_json = canonical_json(spec)
-        spec_by_hash[sh] = spec
-        json_by_hash[sh] = spec_json
-        for fold in plan.folds:
-            fold_tasks.append(
-                FoldEvalTask(
-                    task_id=f"{sh}:{fold.fold}",
-                    fold=fold.fold,
-                    strategy_spec=spec,
-                    strategy_hash=sh,
-                    strategy_json=spec_json,
-                    backtest_cfg=cfg.backtest,
-                    cost_cfg=cfg.costs,
-                )
-            )
-
-    fold_results, exec_stats = execute_tasks(
-        eval_fold_task,
-        fold_tasks,
-        cfg.execution,
-        process_initializer=init_eval_context,
-        process_initargs=(context,),
-    )
-
-    # Store execution stats once (verifies parallel mode + fallbacks)
+    # Exec info (we fill at the end, but create row now so it's always present)
     exec_run_id = db.start_run(
         experiment_id=exp_id,
         split="exec",
@@ -132,30 +89,132 @@ def run_experiment(cfg: EngineConfig) -> int:
         strategy_json="{}",
         strategy_hash="__experiment__",
     )
-    db.finish_run(
-        exec_run_id,
-        status="ok",
-        metrics={
-            "exec_n_tasks": float(exec_stats.n_tasks),
-            "exec_n_jobs": float(exec_stats.n_jobs),
-            "exec_had_fallback": float(1.0 if exec_stats.had_fallback else 0.0),
-        },
-        elapsed_ms=0,
-        artifacts={
-            "exec_stats": {
-                "mode": exec_stats.mode,
-                "n_jobs": exec_stats.n_jobs,
-                "n_tasks": exec_stats.n_tasks,
-                "had_fallback": exec_stats.had_fallback,
-                "fallback_reason": exec_stats.fallback_reason,
-            }
-        },
-    )
 
-    # Persist fold runs + accumulate per-strategy fold metrics
+    # Candidate generation + dedup (important for future generators)
+    rng = np.random.default_rng(cfg.seed)
+    raw_candidates = list(generate_candidates(cfg.research, cfg.data.n_features, rng))
+
+    unique_by_hash: Dict[str, StrategySpec] = {}
+    for spec in raw_candidates:
+        sh = spec.spec_hash()
+        if sh not in unique_by_hash:
+            unique_by_hash[sh] = spec
+    candidates = list(unique_by_hash.values())
+
+    n_candidates_generated = len(raw_candidates)
+    n_candidates_unique = len(candidates)
+
+    # Shared evaluation context (fold data)
+    fold_frames: List[Tuple[Any, Any]] = [(f.train.frame, f.valid.frame) for f in plan.folds]
+    context = {
+        "folds": fold_frames,
+        "holdout_train": plan.holdout_train.frame,
+        "holdout_test": None if plan.holdout_test is None else plan.holdout_test.frame,
+    }
+    init_eval_context(context)
+
     sel_metric = cfg.research.selection_metric
     n_folds = len(plan.folds)
 
+    # Prepare tasks with cache reuse
+    fold_tasks: List[FoldEvalTask] = []
+    cached_fold_results: List[Dict[str, Any]] = []
+
+    spec_by_hash: Dict[str, StrategySpec] = {}
+    json_by_hash: Dict[str, str] = {}
+
+    cache_fold_tasks_skipped = 0
+
+    for spec in candidates:
+        sh = spec.spec_hash()
+        spec_json = canonical_json(spec)
+        spec_by_hash[sh] = spec
+        json_by_hash[sh] = spec_json
+
+        for fold in plan.folds:
+            fold_id = int(fold.fold)
+
+            # Cache lookup: if BOTH train + valid exist, skip compute
+            train_ref = db.fetch_cached_run_ref(
+                config_hash=config_hash,
+                code_hash=code_hash,
+                strategy_hash=sh,
+                split="train",
+                fold=fold_id,
+                exclude_experiment_id=exp_id,
+            )
+            valid_ref = db.fetch_cached_run_ref(
+                config_hash=config_hash,
+                code_hash=code_hash,
+                strategy_hash=sh,
+                split="valid",
+                fold=fold_id,
+                exclude_experiment_id=exp_id,
+            )
+
+            if train_ref is not None and valid_ref is not None:
+                m_train = db.fetch_run_metrics(train_ref["run_id"])
+                m_valid = db.fetch_run_metrics(valid_ref["run_id"])
+                a_valid = db.fetch_artifact_json_by_run_id(valid_ref["run_id"], "equity_curve_head")
+
+                cached_fold_results.append(
+                    {
+                        "task_id": f"{sh}:{fold_id}",
+                        "fold": fold_id,
+                        "strategy_name": spec.name,
+                        "strategy_hash": sh,
+                        "strategy_json": spec_json,
+                        "train_n": int(len(fold.train.frame)),
+                        "valid_n": int(len(fold.valid.frame)),
+                        "train": {
+                            "status": "ok",
+                            "error": None,
+                            "metrics": m_train,
+                            "elapsed_ms": 0,
+                            "cached": True,
+                            "cache_ref": train_ref,
+                        },
+                        "valid": {
+                            "status": "ok",
+                            "error": None,
+                            "metrics": m_valid,
+                            "elapsed_ms": 0,
+                            "artifact": a_valid,
+                            "cached": True,
+                            "cache_ref": valid_ref,
+                        },
+                    }
+                )
+                cache_fold_tasks_skipped += 1
+                continue
+
+            # otherwise compute
+            fold_tasks.append(
+                FoldEvalTask(
+                    task_id=f"{sh}:{fold_id}",
+                    fold=fold_id,
+                    strategy_spec=spec,
+                    strategy_hash=sh,
+                    strategy_json=spec_json,
+                    backtest_cfg=cfg.backtest,
+                    cost_cfg=cfg.costs,
+                )
+            )
+
+    fold_results_computed, fold_exec_stats = execute_tasks(
+        eval_fold_task,
+        fold_tasks,
+        cfg.execution,
+        process_initializer=init_eval_context,
+        process_initargs=(context,),
+    )
+
+    # Combine cached + computed
+    fold_results: List[Dict[str, Any]] = []
+    fold_results.extend(cached_fold_results)
+    fold_results.extend(fold_results_computed)
+
+    # Persist fold runs + accumulate per-strategy metrics
     per_strategy_valid_vals: Dict[str, List[float]] = {sh: [] for sh in spec_by_hash.keys()}
     per_strategy_fold_compact: Dict[str, List[Dict[str, Any]]] = {sh: [] for sh in spec_by_hash.keys()}
 
@@ -165,8 +224,10 @@ def run_experiment(cfg: EngineConfig) -> int:
         spec_name = res["strategy_name"]
         spec_json = res["strategy_json"]
 
-        # Train persist
         train = res["train"]
+        valid = res["valid"]
+
+        # Train persist
         run_id_train = db.start_run(
             experiment_id=exp_id,
             split="train",
@@ -175,17 +236,24 @@ def run_experiment(cfg: EngineConfig) -> int:
             strategy_json=spec_json,
             strategy_hash=sh,
         )
+
+        m_train = dict(train.get("metrics", {}) or {})
+        train_cached = bool(train.get("cached", False))
+        m_train["cached"] = 1.0 if train_cached else 0.0
+
+        train_artifacts: Dict[str, Any] = {}
+        if train_cached and isinstance(train.get("cache_ref"), dict):
+            train_artifacts["cache_info"] = {"cached": True, **train["cache_ref"]}
         db.finish_run(
             run_id_train,
             status=str(train.get("status", "error")),
             error=train.get("error"),
-            metrics=train.get("metrics", {}),
+            metrics=m_train if str(train.get("status")) == "ok" else {},
             elapsed_ms=int(train.get("elapsed_ms", 0)),
-            artifacts=None,
+            artifacts=train_artifacts or None,
         )
 
         # Valid persist
-        valid = res["valid"]
         run_id_valid = db.start_run(
             experiment_id=exp_id,
             split="valid",
@@ -194,22 +262,29 @@ def run_experiment(cfg: EngineConfig) -> int:
             strategy_json=spec_json,
             strategy_hash=sh,
         )
-        artifacts = None
+
+        m_valid = dict(valid.get("metrics", {}) or {})
+        valid_cached = bool(valid.get("cached", False))
+        m_valid["cached"] = 1.0 if valid_cached else 0.0
+
+        valid_artifacts: Dict[str, Any] = {}
         if valid.get("status") == "ok" and valid.get("artifact") is not None:
-            artifacts = {"equity_curve_head": valid["artifact"]}
+            valid_artifacts["equity_curve_head"] = valid["artifact"]
+        if valid_cached and isinstance(valid.get("cache_ref"), dict):
+            valid_artifacts["cache_info"] = {"cached": True, **valid["cache_ref"]}
 
         db.finish_run(
             run_id_valid,
             status=str(valid.get("status", "error")),
             error=valid.get("error"),
-            metrics=valid.get("metrics", {}),
+            metrics=m_valid if str(valid.get("status")) == "ok" else {},
             elapsed_ms=int(valid.get("elapsed_ms", 0)),
-            artifacts=artifacts,
+            artifacts=valid_artifacts or None,
         )
 
-        # Aggregate fold compact
-        v_metrics = valid.get("metrics", {}) if valid.get("status") == "ok" else {}
-        t_metrics = train.get("metrics", {}) if train.get("status") == "ok" else {}
+        # Aggregate fold compact + selection metric
+        v_metrics = m_valid if valid.get("status") == "ok" else {}
+        t_metrics = m_train if train.get("status") == "ok" else {}
 
         v_val = float(v_metrics.get(sel_metric, float("nan")))
         t_val = float(t_metrics.get(sel_metric, float("nan")))
@@ -223,6 +298,8 @@ def run_experiment(cfg: EngineConfig) -> int:
                 "valid_metric": v_val,
                 "train_status": str(train.get("status", "error")),
                 "valid_status": str(valid.get("status", "error")),
+                "train_cached": bool(train_cached),
+                "valid_cached": bool(valid_cached),
             }
         )
 
@@ -287,14 +364,49 @@ def run_experiment(cfg: EngineConfig) -> int:
     best = ranking[:top_k]
     db.store_best_candidates(exp_id, ranked=best, score_key="cv_score")
 
-    # Holdout test for best candidates
+    # Holdout test for best candidates, with cache reuse
+    holdout_tasks: List[HoldoutEvalTask] = []
+    cached_holdout_results: List[Dict[str, Any]] = []
+    cache_test_tasks_skipped = 0
+
     if plan.holdout_test is not None and len(best) > 0:
-        holdout_tasks: List[HoldoutEvalTask] = []
         for row in best:
             sh = row["strategy_hash"]
             spec = spec_by_hash.get(sh)
             if spec is None:
                 continue
+
+            test_ref = db.fetch_cached_run_ref(
+                config_hash=config_hash,
+                code_hash=code_hash,
+                strategy_hash=sh,
+                split="test",
+                fold=None,
+                exclude_experiment_id=exp_id,
+            )
+            if test_ref is not None:
+                m_test = db.fetch_run_metrics(test_ref["run_id"])
+                a_test = db.fetch_artifact_json_by_run_id(test_ref["run_id"], "equity_curve_head")
+                cached_holdout_results.append(
+                    {
+                        "task_id": f"{sh}:holdout",
+                        "strategy_name": spec.name,
+                        "strategy_hash": sh,
+                        "strategy_json": json_by_hash[sh],
+                        "test": {
+                            "status": "ok",
+                            "error": None,
+                            "metrics": m_test,
+                            "elapsed_ms": 0,
+                            "artifact": a_test,
+                            "cached": True,
+                            "cache_ref": test_ref,
+                        },
+                    }
+                )
+                cache_test_tasks_skipped += 1
+                continue
+
             holdout_tasks.append(
                 HoldoutEvalTask(
                     task_id=f"{sh}:holdout",
@@ -306,13 +418,17 @@ def run_experiment(cfg: EngineConfig) -> int:
                 )
             )
 
-        holdout_results, _ = execute_tasks(
+        holdout_results_computed, holdout_exec_stats = execute_tasks(
             eval_holdout_task,
             holdout_tasks,
             cfg.execution,
             process_initializer=init_eval_context,
             process_initargs=(context,),
         )
+
+        holdout_results: List[Dict[str, Any]] = []
+        holdout_results.extend(cached_holdout_results)
+        holdout_results.extend(holdout_results_computed)
 
         for res in holdout_results:
             sh = res["strategy_hash"]
@@ -328,18 +444,75 @@ def run_experiment(cfg: EngineConfig) -> int:
                 strategy_json=spec_json,
                 strategy_hash=sh,
             )
-            artifacts = None
+
+            m_test = dict(test.get("metrics", {}) or {})
+            test_cached = bool(test.get("cached", False))
+            m_test["cached"] = 1.0 if test_cached else 0.0
+
+            test_artifacts: Dict[str, Any] = {}
             if test.get("status") == "ok" and test.get("artifact") is not None:
-                artifacts = {"equity_curve_head": test["artifact"]}
+                test_artifacts["equity_curve_head"] = test["artifact"]
+            if test_cached and isinstance(test.get("cache_ref"), dict):
+                test_artifacts["cache_info"] = {"cached": True, **test["cache_ref"]}
 
             db.finish_run(
                 run_id_test,
                 status=str(test.get("status", "error")),
                 error=test.get("error"),
-                metrics=test.get("metrics", {}),
+                metrics=m_test if str(test.get("status")) == "ok" else {},
                 elapsed_ms=int(test.get("elapsed_ms", 0)),
-                artifacts=artifacts,
+                artifacts=test_artifacts or None,
             )
+    else:
+        holdout_exec_stats = None  # noqa: F841
+
+    # Finish exec stats (audit: executor + cache + dedup)
+    fold_tasks_total = int(n_candidates_unique) * int(n_folds)
+    fold_tasks_executed = int(fold_exec_stats.n_tasks)
+    fold_tasks_skipped = int(cache_fold_tasks_skipped)
+
+    test_tasks_total = int(top_k) if (plan.holdout_test is not None) else 0
+    test_tasks_executed = int(len(holdout_tasks))
+    test_tasks_skipped = int(cache_test_tasks_skipped)
+
+    db.finish_run(
+        exec_run_id,
+        status="ok",
+        metrics={
+            "exec_n_tasks": float(fold_exec_stats.n_tasks),
+            "exec_n_jobs": float(fold_exec_stats.n_jobs),
+            "exec_had_fallback": float(1.0 if fold_exec_stats.had_fallback else 0.0),
+            "candidates_generated": float(n_candidates_generated),
+            "candidates_unique": float(n_candidates_unique),
+            "cache_fold_tasks_total": float(fold_tasks_total),
+            "cache_fold_tasks_executed": float(fold_tasks_executed),
+            "cache_fold_tasks_skipped": float(fold_tasks_skipped),
+            "cache_test_tasks_total": float(test_tasks_total),
+            "cache_test_tasks_executed": float(test_tasks_executed),
+            "cache_test_tasks_skipped": float(test_tasks_skipped),
+        },
+        elapsed_ms=0,
+        artifacts={
+            "exec_stats": {
+                "mode": fold_exec_stats.mode,
+                "requested_n_jobs": int(cfg.execution.n_jobs),
+                "prefer_processes": bool(cfg.execution.prefer_processes),
+                "n_jobs_used": int(fold_exec_stats.n_jobs),
+                "n_tasks_executed": int(fold_exec_stats.n_tasks),
+                "had_fallback": bool(fold_exec_stats.had_fallback),
+                "fallback_reason": fold_exec_stats.fallback_reason,
+                "candidates_generated": int(n_candidates_generated),
+                "candidates_unique": int(n_candidates_unique),
+                "fold_tasks_total": int(fold_tasks_total),
+                "fold_tasks_executed": int(fold_tasks_executed),
+                "fold_tasks_skipped": int(fold_tasks_skipped),
+                "test_tasks_total": int(test_tasks_total),
+                "test_tasks_executed": int(test_tasks_executed),
+                "test_tasks_skipped": int(test_tasks_skipped),
+                "cache_key": {"config_hash": config_hash, "code_hash": code_hash},
+            }
+        },
+    )
 
     db.close()
     return exp_id

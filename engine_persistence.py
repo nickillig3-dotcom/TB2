@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import zlib
 from typing import Any, Dict, Optional
@@ -49,9 +50,8 @@ class SQLitePersistence:
             );
             """
         )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_conf_code ON experiments(config_hash, code_hash);")
 
-        # NOTE: fold column is included for NEW DBs.
-        # For older DBs we add it in _migrate_schema().
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS runs (
@@ -72,6 +72,8 @@ class SQLitePersistence:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_experiment_split ON runs(experiment_id, split);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_strategy_hash ON runs(strategy_hash);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_fold ON runs(experiment_id, fold);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_lookup ON runs(strategy_hash, split, fold, status);")
 
         cur.execute(
             """
@@ -126,18 +128,12 @@ class SQLitePersistence:
         return column in cols
 
     def _migrate_schema(self) -> None:
-        """Forward-only tiny migrations for local dev.
-
-        v2: add runs.fold (nullable INTEGER) for walk-forward CV.
-        """
+        """Forward-only tiny migrations for local dev."""
         cur = self.conn.cursor()
 
+        # v2: add runs.fold (nullable INTEGER) for walk-forward CV.
         if not self._column_exists("runs", "fold"):
             cur.execute("ALTER TABLE runs ADD COLUMN fold INTEGER;")
-
-        # Only create fold index if the column exists (important for migrating older DBs).
-        if self._column_exists("runs", "fold"):
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_fold ON runs(experiment_id, fold);")
 
         self.conn.commit()
 
@@ -268,30 +264,6 @@ class SQLitePersistence:
         )
         return [dict(r) for r in cur.fetchall()]
 
-    def fetch_top_runs(
-        self,
-        experiment_id: int,
-        split: str,
-        metric_key: str,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            SELECT r.run_id, r.strategy_name, r.strategy_hash, r.fold, m.value AS metric
-            FROM runs r
-            JOIN metrics m ON m.run_id = r.run_id
-            WHERE r.experiment_id = ?
-              AND r.split = ?
-              AND r.status = 'ok'
-              AND m.key = ?
-            ORDER BY m.value DESC
-            LIMIT ?
-            """,
-            (int(experiment_id), str(split), str(metric_key), int(limit)),
-        )
-        return [dict(r) for r in cur.fetchall()]
-
     def fetch_latest_metric_for_strategy(
         self,
         experiment_id: int,
@@ -317,3 +289,153 @@ class SQLitePersistence:
         )
         row = cur.fetchone()
         return None if row is None else float(row["value"])
+
+    def fetch_latest_artifact_json(
+        self,
+        experiment_id: int,
+        split: str,
+        name: str,
+        strategy_hash: Optional[str] = None,
+    ) -> Optional[Any]:
+        cur = self.conn.cursor()
+        if strategy_hash is None:
+            cur.execute(
+                """
+                SELECT a.content, a.compression, a.content_type
+                FROM runs r
+                JOIN artifacts a ON a.run_id = r.run_id
+                WHERE r.experiment_id = ?
+                  AND r.split = ?
+                  AND a.name = ?
+                ORDER BY r.run_id DESC
+                LIMIT 1
+                """,
+                (int(experiment_id), str(split), str(name)),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT a.content, a.compression, a.content_type
+                FROM runs r
+                JOIN artifacts a ON a.run_id = r.run_id
+                WHERE r.experiment_id = ?
+                  AND r.split = ?
+                  AND r.strategy_hash = ?
+                  AND a.name = ?
+                ORDER BY r.run_id DESC
+                LIMIT 1
+                """,
+                (int(experiment_id), str(split), str(strategy_hash), str(name)),
+            )
+
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        blob = row["content"]
+        compression = row["compression"]
+        if compression == "zlib":
+            blob = zlib.decompress(blob)
+
+        try:
+            return json.loads(blob.decode("utf-8"))
+        except Exception:
+            return None
+
+    # -------- Cache helpers (cross-experiment reuse) --------------------------
+
+    def fetch_run_metrics(self, run_id: int) -> Dict[str, float]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT key, value
+            FROM metrics
+            WHERE run_id = ?
+            """,
+            (int(run_id),),
+        )
+        out: Dict[str, float] = {}
+        for r in cur.fetchall():
+            out[str(r["key"])] = float(r["value"]) if r["value"] is not None else float("nan")
+        return out
+
+    def fetch_artifact_json_by_run_id(self, run_id: int, name: str) -> Optional[Any]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT content, compression, content_type
+            FROM artifacts
+            WHERE run_id = ?
+              AND name = ?
+            LIMIT 1
+            """,
+            (int(run_id), str(name)),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        blob = row["content"]
+        compression = row["compression"]
+        if compression == "zlib":
+            blob = zlib.decompress(blob)
+
+        try:
+            return json.loads(blob.decode("utf-8"))
+        except Exception:
+            return None
+
+    def fetch_cached_run_ref(
+        self,
+        config_hash: str,
+        code_hash: str,
+        strategy_hash: str,
+        split: str,
+        fold: Optional[int],
+        exclude_experiment_id: int,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Find a previous run (different experiment) with same (config_hash, code_hash, strategy_hash, split, fold).
+        Returns: {"run_id": ..., "experiment_id": ...} or None.
+        """
+        cur = self.conn.cursor()
+
+        if fold is None:
+            cur.execute(
+                """
+                SELECT r.run_id, r.experiment_id
+                FROM runs r
+                JOIN experiments e ON e.experiment_id = r.experiment_id
+                WHERE e.config_hash = ?
+                  AND e.code_hash = ?
+                  AND r.strategy_hash = ?
+                  AND r.split = ?
+                  AND r.fold IS NULL
+                  AND r.status = 'ok'
+                  AND r.experiment_id != ?
+                ORDER BY r.run_id DESC
+                LIMIT 1
+                """,
+                (str(config_hash), str(code_hash), str(strategy_hash), str(split), int(exclude_experiment_id)),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT r.run_id, r.experiment_id
+                FROM runs r
+                JOIN experiments e ON e.experiment_id = r.experiment_id
+                WHERE e.config_hash = ?
+                  AND e.code_hash = ?
+                  AND r.strategy_hash = ?
+                  AND r.split = ?
+                  AND r.fold = ?
+                  AND r.status = 'ok'
+                  AND r.experiment_id != ?
+                ORDER BY r.run_id DESC
+                LIMIT 1
+                """,
+                (str(config_hash), str(code_hash), str(strategy_hash), str(split), int(fold), int(exclude_experiment_id)),
+            )
+
+        row = cur.fetchone()
+        return None if row is None else {"run_id": int(row["run_id"]), "experiment_id": int(row["experiment_id"])}

@@ -17,8 +17,8 @@ class SQLitePersistence:
         self.conn = sqlite3.connect(db_path, timeout=60.0)
         self.conn.row_factory = sqlite3.Row
         self._apply_pragmas()
-        self._create_tables()
-        self._migrate_schema()
+        self._create_tables()     # create base tables (no risky indexes)
+        self._migrate_schema()    # add columns + create indexes safely
 
     def close(self) -> None:
         try:
@@ -36,7 +36,8 @@ class SQLitePersistence:
     def _create_tables(self) -> None:
         cur = self.conn.cursor()
 
-        # NOTE: evaluation_hash exists for NEW DBs; for existing DBs it's added in _migrate_schema().
+        # NOTE: CREATE TABLE IF NOT EXISTS will NOT alter existing tables.
+        # Therefore: indexes that reference newly-added columns MUST NOT be created here.
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS experiments (
@@ -47,13 +48,13 @@ class SQLitePersistence:
                 config_json TEXT NOT NULL,
                 config_hash TEXT NOT NULL,
                 evaluation_hash TEXT,
+                eval_code_hash TEXT,
                 code_hash TEXT NOT NULL,
                 python TEXT NOT NULL,
                 platform TEXT NOT NULL
             );
             """
         )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_conf_code ON experiments(config_hash, code_hash);")
 
         cur.execute(
             """
@@ -73,10 +74,6 @@ class SQLitePersistence:
             );
             """
         )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_experiment_split ON runs(experiment_id, split);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_strategy_hash ON runs(strategy_hash);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_fold ON runs(experiment_id, fold);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_lookup ON runs(strategy_hash, split, fold, status);")
 
         cur.execute(
             """
@@ -89,7 +86,6 @@ class SQLitePersistence:
             );
             """
         )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_metrics_key_value ON metrics(key, value);")
 
         cur.execute(
             """
@@ -130,27 +126,65 @@ class SQLitePersistence:
         cols = [r["name"] for r in cur.fetchall()]
         return column in cols
 
+    def _ensure_indexes(self) -> None:
+        """Create indexes only after schema is known to contain required columns."""
+        cur = self.conn.cursor()
+
+        # experiments indexes
+        if self._column_exists("experiments", "config_hash") and self._column_exists("experiments", "code_hash"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_conf_code ON experiments(config_hash, code_hash);")
+
+        if self._column_exists("experiments", "evaluation_hash") and self._column_exists("experiments", "code_hash"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_eval_code ON experiments(evaluation_hash, code_hash);")
+
+        if self._column_exists("experiments", "evaluation_hash") and self._column_exists("experiments", "eval_code_hash"):
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_experiments_eval_evalcode ON experiments(evaluation_hash, eval_code_hash);"
+            )
+
+        # runs indexes
+        if self._column_exists("runs", "experiment_id") and self._column_exists("runs", "split"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_experiment_split ON runs(experiment_id, split);")
+
+        if self._column_exists("runs", "strategy_hash"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_strategy_hash ON runs(strategy_hash);")
+
+        if self._column_exists("runs", "experiment_id") and self._column_exists("runs", "fold"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_fold ON runs(experiment_id, fold);")
+
+        if (
+            self._column_exists("runs", "strategy_hash")
+            and self._column_exists("runs", "split")
+            and self._column_exists("runs", "fold")
+            and self._column_exists("runs", "status")
+        ):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_lookup ON runs(strategy_hash, split, fold, status);")
+
+        # metrics indexes
+        if self._column_exists("metrics", "key") and self._column_exists("metrics", "value"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_metrics_key_value ON metrics(key, value);")
+
+        self.conn.commit()
+
     def _migrate_schema(self) -> None:
         """Forward-only tiny migrations for local dev."""
         cur = self.conn.cursor()
 
-        # v2: add runs.fold (nullable)
+        # v2: runs.fold
         if not self._column_exists("runs", "fold"):
             cur.execute("ALTER TABLE runs ADD COLUMN fold INTEGER;")
 
-        # v3: add experiments.evaluation_hash (nullable)
+        # v3: experiments.evaluation_hash
         if not self._column_exists("experiments", "evaluation_hash"):
             cur.execute("ALTER TABLE experiments ADD COLUMN evaluation_hash TEXT;")
 
-        # Index for evaluation_hash-based cache lookup
-        if self._column_exists("experiments", "evaluation_hash"):
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_experiments_eval_code ON experiments(evaluation_hash, code_hash);"
-            )
+        # v4: experiments.eval_code_hash
+        if not self._column_exists("experiments", "eval_code_hash"):
+            cur.execute("ALTER TABLE experiments ADD COLUMN eval_code_hash TEXT;")
 
         self.conn.commit()
 
-        # Backfill evaluation_hash for older rows (best effort)
+        # Backfill evaluation_hash if missing (best effort)
         if self._column_exists("experiments", "evaluation_hash"):
             cur = self.conn.cursor()
             cur.execute(
@@ -175,6 +209,21 @@ class SQLitePersistence:
                     )
                 self.conn.commit()
 
+        # Backfill eval_code_hash (safe fallback: set to code_hash if missing)
+        if self._column_exists("experiments", "eval_code_hash") and self._column_exists("experiments", "code_hash"):
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                UPDATE experiments
+                SET eval_code_hash = code_hash
+                WHERE eval_code_hash IS NULL OR eval_code_hash = ''
+                """
+            )
+            self.conn.commit()
+
+        # Finally: create indexes safely
+        self._ensure_indexes()
+
     def create_experiment(
         self,
         run_name: str,
@@ -182,14 +231,15 @@ class SQLitePersistence:
         config_json: str,
         config_hash: str,
         evaluation_hash: str,
+        eval_code_hash: str,
         code_hash: str,
     ) -> int:
         env = env_fingerprint()
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO experiments(created_at, run_name, mode, config_json, config_hash, evaluation_hash, code_hash, python, platform)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO experiments(created_at, run_name, mode, config_json, config_hash, evaluation_hash, eval_code_hash, code_hash, python, platform)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_utc_iso(),
@@ -198,6 +248,7 @@ class SQLitePersistence:
                 config_json,
                 config_hash,
                 evaluation_hash,
+                eval_code_hash,
                 code_hash,
                 env["python"],
                 env["platform"],
@@ -350,7 +401,7 @@ class SQLitePersistence:
         if strategy_hash is None:
             cur.execute(
                 """
-                SELECT a.content, a.compression, a.content_type
+                SELECT a.content, a.compression
                 FROM runs r
                 JOIN artifacts a ON a.run_id = r.run_id
                 WHERE r.experiment_id = ?
@@ -364,7 +415,7 @@ class SQLitePersistence:
         else:
             cur.execute(
                 """
-                SELECT a.content, a.compression, a.content_type
+                SELECT a.content, a.compression
                 FROM runs r
                 JOIN artifacts a ON a.run_id = r.run_id
                 WHERE r.experiment_id = ?
@@ -382,8 +433,7 @@ class SQLitePersistence:
             return None
 
         blob = row["content"]
-        compression = row["compression"]
-        if compression == "zlib":
+        if row["compression"] == "zlib":
             blob = zlib.decompress(blob)
 
         try:
@@ -412,7 +462,7 @@ class SQLitePersistence:
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT content, compression, content_type
+            SELECT content, compression
             FROM artifacts
             WHERE run_id = ?
               AND name = ?
@@ -425,8 +475,7 @@ class SQLitePersistence:
             return None
 
         blob = row["content"]
-        compression = row["compression"]
-        if compression == "zlib":
+        if row["compression"] == "zlib":
             blob = zlib.decompress(blob)
 
         try:
@@ -437,14 +486,14 @@ class SQLitePersistence:
     def fetch_cached_run_ref(
         self,
         evaluation_hash: str,
-        code_hash: str,
+        eval_code_hash: str,
         strategy_hash: str,
         split: str,
         fold: Optional[int],
         exclude_experiment_id: int,
     ) -> Optional[dict[str, Any]]:
         """
-        Find a previous run (different experiment) with same (evaluation_hash, code_hash, strategy_hash, split, fold).
+        Find a previous run (different experiment) with same (evaluation_hash, eval_code_hash, strategy_hash, split, fold).
         Returns: {"run_id": ..., "experiment_id": ...} or None.
         """
         cur = self.conn.cursor()
@@ -456,7 +505,7 @@ class SQLitePersistence:
                 FROM runs r
                 JOIN experiments e ON e.experiment_id = r.experiment_id
                 WHERE e.evaluation_hash = ?
-                  AND e.code_hash = ?
+                  AND e.eval_code_hash = ?
                   AND r.strategy_hash = ?
                   AND r.split = ?
                   AND r.fold IS NULL
@@ -465,7 +514,7 @@ class SQLitePersistence:
                 ORDER BY r.run_id DESC
                 LIMIT 1
                 """,
-                (str(evaluation_hash), str(code_hash), str(strategy_hash), str(split), int(exclude_experiment_id)),
+                (str(evaluation_hash), str(eval_code_hash), str(strategy_hash), str(split), int(exclude_experiment_id)),
             )
         else:
             cur.execute(
@@ -474,7 +523,7 @@ class SQLitePersistence:
                 FROM runs r
                 JOIN experiments e ON e.experiment_id = r.experiment_id
                 WHERE e.evaluation_hash = ?
-                  AND e.code_hash = ?
+                  AND e.eval_code_hash = ?
                   AND r.strategy_hash = ?
                   AND r.split = ?
                   AND r.fold = ?
@@ -483,28 +532,24 @@ class SQLitePersistence:
                 ORDER BY r.run_id DESC
                 LIMIT 1
                 """,
-                (
-                    str(evaluation_hash),
-                    str(code_hash),
-                    str(strategy_hash),
-                    str(split),
-                    int(fold),
-                    int(exclude_experiment_id),
-                ),
+                (str(evaluation_hash), str(eval_code_hash), str(strategy_hash), str(split), int(fold), int(exclude_experiment_id)),
             )
 
         row = cur.fetchone()
         return None if row is None else {"run_id": int(row["run_id"]), "experiment_id": int(row["experiment_id"])}
+
     def cache_diagnostics(
         self,
         evaluation_hash: str,
+        eval_code_hash: str,
         code_hash: str,
         exclude_experiment_id: int,
     ) -> dict[str, Any]:
         """
-        Quick diagnostics to explain cache hits/misses.
-        - same_eval_experiments: prior experiments with same evaluation_hash
-        - same_eval_code_experiments: prior experiments with same evaluation_hash AND code_hash
+        Explain cache hits/misses:
+          - same_eval_experiments: same evaluation_hash exists at all
+          - same_eval_evalcode_experiments: same evaluation_hash AND eval_code_hash (actual cache key)
+          - same_eval_fullcode_experiments: same evaluation_hash AND full code_hash
         """
         cur = self.conn.cursor()
 
@@ -524,16 +569,16 @@ class SQLitePersistence:
             SELECT COUNT(*) AS n
             FROM experiments
             WHERE evaluation_hash = ?
-              AND code_hash = ?
+              AND eval_code_hash = ?
               AND experiment_id != ?
             """,
-            (str(evaluation_hash), str(code_hash), int(exclude_experiment_id)),
+            (str(evaluation_hash), str(eval_code_hash), int(exclude_experiment_id)),
         )
-        same_eval_code = int(cur.fetchone()["n"])
+        same_eval_evalcode = int(cur.fetchone()["n"])
 
         cur.execute(
             """
-            SELECT MAX(experiment_id) AS max_id
+            SELECT COUNT(*) AS n
             FROM experiments
             WHERE evaluation_hash = ?
               AND code_hash = ?
@@ -541,11 +586,24 @@ class SQLitePersistence:
             """,
             (str(evaluation_hash), str(code_hash), int(exclude_experiment_id)),
         )
+        same_eval_fullcode = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            SELECT MAX(experiment_id) AS max_id
+            FROM experiments
+            WHERE evaluation_hash = ?
+              AND eval_code_hash = ?
+              AND experiment_id != ?
+            """,
+            (str(evaluation_hash), str(eval_code_hash), int(exclude_experiment_id)),
+        )
         row = cur.fetchone()
-        latest_same_eval_code = None if row is None or row["max_id"] is None else int(row["max_id"])
+        latest_same_eval_evalcode = None if row is None or row["max_id"] is None else int(row["max_id"])
 
         return {
             "same_eval_experiments": same_eval,
-            "same_eval_code_experiments": same_eval_code,
-            "latest_same_eval_code_experiment_id": latest_same_eval_code,
+            "same_eval_evalcode_experiments": same_eval_evalcode,
+            "same_eval_fullcode_experiments": same_eval_fullcode,
+            "latest_same_eval_evalcode_experiment_id": latest_same_eval_evalcode,
         }

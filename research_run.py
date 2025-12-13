@@ -38,7 +38,6 @@ def main(argv: list[str] | None = None) -> int:
             f" had_fallback={exec_stats.get('had_fallback')}"
         )
 
-        # Cache summary (if present)
         f_total = exec_stats.get("fold_tasks_total")
         f_skip = exec_stats.get("fold_tasks_skipped")
         t_total = exec_stats.get("test_tasks_total")
@@ -49,24 +48,27 @@ def main(argv: list[str] | None = None) -> int:
         if f_total is not None:
             print(f"Cache: fold_skipped={f_skip}/{f_total} | test_skipped={t_skip}/{t_total} | unique_candidates={c_uni}/{c_gen}")
 
-        # Cache diagnostics (why did we compute vs reuse?)
         cache_key = exec_stats.get("cache_key") if isinstance(exec_stats.get("cache_key"), dict) else {}
         eval_h = cache_key.get("evaluation_hash")
+        eval_code_h = cache_key.get("eval_code_hash")
         code_h = cache_key.get("code_hash")
-        if isinstance(eval_h, str) and isinstance(code_h, str):
-            diag = db.cache_diagnostics(eval_h, code_h, exclude_experiment_id=exp_id)
+
+        if isinstance(eval_h, str) and isinstance(eval_code_h, str) and isinstance(code_h, str):
+            diag = db.cache_diagnostics(eval_h, eval_code_h, code_h, exclude_experiment_id=exp_id)
             print(
                 "CacheDiag:"
                 f" same_eval_experiments={diag.get('same_eval_experiments')}"
-                f" same_eval_code_experiments={diag.get('same_eval_code_experiments')}"
-                f" latest_same_eval_code_experiment_id={diag.get('latest_same_eval_code_experiment_id')}"
+                f" same_eval_evalcode_experiments={diag.get('same_eval_evalcode_experiments')}"
+                f" same_eval_fullcode_experiments={diag.get('same_eval_fullcode_experiments')}"
+                f" latest_same_eval_evalcode_experiment_id={diag.get('latest_same_eval_evalcode_experiment_id')}"
             )
-            # Human hint
-            if (diag.get("same_eval_experiments", 0) > 0) and (diag.get("same_eval_code_experiments", 0) == 0):
-                print("CacheHint: gleiche Evaluation existiert, aber code_hash anders -> Recompute nach Code-Änderung ist erwartbar.")
-            elif (diag.get("same_eval_code_experiments", 0) == 0):
-                print("CacheHint: cold cache für diese eval_hash+code_hash Kombi (erster Run). Re-run => volle Cache-Hits.")
 
+            if (diag.get("same_eval_experiments", 0) > 0) and (diag.get("same_eval_evalcode_experiments", 0) == 0):
+                print("CacheHint: gleiche Evaluation existiert, aber eval_code_hash anders -> Recompute ist erwartbar (Eval-Engine geändert / erster Run nach eval_code_key).")
+            elif (diag.get("same_eval_evalcode_experiments", 0) == 0):
+                print("CacheHint: cold cache für eval_hash+eval_code_hash (erster Run). Re-run => volle Cache-Hits.")
+            elif (diag.get("same_eval_evalcode_experiments", 0) > 0) and (diag.get("same_eval_fullcode_experiments", 0) == 0):
+                print("CacheHint: eval_code gleich, full code anders -> Cache sollte trotzdem greifen (genau dafür ist eval_code_hash da).")
     else:
         print("Executor: (no exec_stats found)")
 
@@ -93,3 +95,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+# non-eval change: should NOT break cache

@@ -122,3 +122,29 @@ def ensure_monotonic_datetime_index(df: pd.DataFrame) -> None:
         raise ValueError("DataFrame index must be monotonic increasing")
     if df.index.has_duplicates:
         raise ValueError("DataFrame index must not contain duplicates")
+def compute_files_hash(file_paths: list[str]) -> str:
+    """
+    Deterministic content hash over an explicit list of files.
+    Used to compute eval_code_hash (evaluation-critical subset).
+
+    Graceful behavior:
+      - If a file is missing, we still produce a deterministic hash including "MISSING:<path>"
+        instead of crashing.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in sorted(file_paths):
+        h.update(p.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            with open(p, "rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except FileNotFoundError:
+            h.update(f"MISSING:{p}".encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:12]

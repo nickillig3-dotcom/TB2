@@ -7,6 +7,7 @@ import numpy as np
 from engine_config import EngineConfig
 from engine_cv import CvPlan, build_cv_plan
 from engine_data import DataSet, make_synthetic_dataset
+from engine_evalcode import compute_eval_code_hash
 from engine_executor import execute_tasks
 from engine_persistence import SQLitePersistence
 from engine_signature import evaluation_hash_from_cfg
@@ -41,11 +42,12 @@ def _agg(values: List[float], method: str) -> float:
 
 
 def run_experiment(cfg: EngineConfig) -> int:
-    """Run research loop (CV + holdout) and persist results."""
     set_global_seed(cfg.seed)
 
     db = SQLitePersistence(cfg.persistence.db_path)
-    code_hash = compute_code_hash(".")
+
+    code_hash = compute_code_hash(".")             # audit/repro full hash
+    eval_code_hash = compute_eval_code_hash()      # cache stability hash
     cfg_json = canonical_json(cfg)
     config_hash = cfg.config_hash()
     evaluation_hash = evaluation_hash_from_cfg(cfg)
@@ -56,13 +58,13 @@ def run_experiment(cfg: EngineConfig) -> int:
         config_json=cfg_json,
         config_hash=config_hash,
         evaluation_hash=evaluation_hash,
+        eval_code_hash=eval_code_hash,
         code_hash=code_hash,
     )
 
     ds = _load_dataset(cfg)
     plan: CvPlan = build_cv_plan(ds, cfg.splits, cfg.cv)
 
-    # Experiment meta (stored once)
     meta_run_id = db.start_run(
         experiment_id=exp_id,
         split="meta",
@@ -83,7 +85,6 @@ def run_experiment(cfg: EngineConfig) -> int:
         artifacts={"cv_plan_meta": plan.meta},
     )
 
-    # Exec info row (filled at end)
     exec_run_id = db.start_run(
         experiment_id=exp_id,
         split="exec",
@@ -93,7 +94,6 @@ def run_experiment(cfg: EngineConfig) -> int:
         strategy_hash="__experiment__",
     )
 
-    # Candidate generation + dedup
     rng = np.random.default_rng(cfg.seed)
     raw_candidates = list(generate_candidates(cfg.research, cfg.data.n_features, rng))
 
@@ -107,7 +107,6 @@ def run_experiment(cfg: EngineConfig) -> int:
     n_candidates_generated = len(raw_candidates)
     n_candidates_unique = len(candidates)
 
-    # Shared evaluation context (fold data)
     fold_frames: List[Tuple[Any, Any]] = [(f.train.frame, f.valid.frame) for f in plan.folds]
     context = {
         "folds": fold_frames,
@@ -119,7 +118,6 @@ def run_experiment(cfg: EngineConfig) -> int:
     sel_metric = cfg.research.selection_metric
     n_folds = len(plan.folds)
 
-    # Prepare fold tasks with cache reuse
     fold_tasks: List[FoldEvalTask] = []
     cached_fold_results: List[Dict[str, Any]] = []
 
@@ -139,7 +137,7 @@ def run_experiment(cfg: EngineConfig) -> int:
 
             train_ref = db.fetch_cached_run_ref(
                 evaluation_hash=evaluation_hash,
-                code_hash=code_hash,
+                eval_code_hash=eval_code_hash,
                 strategy_hash=sh,
                 split="train",
                 fold=fold_id,
@@ -147,7 +145,7 @@ def run_experiment(cfg: EngineConfig) -> int:
             )
             valid_ref = db.fetch_cached_run_ref(
                 evaluation_hash=evaluation_hash,
-                code_hash=code_hash,
+                eval_code_hash=eval_code_hash,
                 strategy_hash=sh,
                 split="valid",
                 fold=fold_id,
@@ -168,23 +166,8 @@ def run_experiment(cfg: EngineConfig) -> int:
                         "strategy_json": spec_json,
                         "train_n": int(len(fold.train.frame)),
                         "valid_n": int(len(fold.valid.frame)),
-                        "train": {
-                            "status": "ok",
-                            "error": None,
-                            "metrics": m_train,
-                            "elapsed_ms": 0,
-                            "cached": True,
-                            "cache_ref": train_ref,
-                        },
-                        "valid": {
-                            "status": "ok",
-                            "error": None,
-                            "metrics": m_valid,
-                            "elapsed_ms": 0,
-                            "artifact": a_valid,
-                            "cached": True,
-                            "cache_ref": valid_ref,
-                        },
+                        "train": {"status": "ok", "error": None, "metrics": m_train, "elapsed_ms": 0, "cached": True, "cache_ref": train_ref},
+                        "valid": {"status": "ok", "error": None, "metrics": m_valid, "elapsed_ms": 0, "artifact": a_valid, "cached": True, "cache_ref": valid_ref},
                     }
                 )
                 cache_fold_tasks_skipped += 1
@@ -210,12 +193,10 @@ def run_experiment(cfg: EngineConfig) -> int:
         process_initargs=(context,),
     )
 
-    # Combine cached + computed
     fold_results: List[Dict[str, Any]] = []
     fold_results.extend(cached_fold_results)
     fold_results.extend(fold_results_computed)
 
-    # Persist fold runs + accumulate per-strategy fold metrics
     per_strategy_valid_vals: Dict[str, List[float]] = {sh: [] for sh in spec_by_hash.keys()}
     per_strategy_fold_compact: Dict[str, List[Dict[str, Any]]] = {sh: [] for sh in spec_by_hash.keys()}
 
@@ -228,24 +209,13 @@ def run_experiment(cfg: EngineConfig) -> int:
         train = res["train"]
         valid = res["valid"]
 
-        # Train persist
-        run_id_train = db.start_run(
-            experiment_id=exp_id,
-            split="train",
-            fold=fold_id,
-            strategy_name=spec_name,
-            strategy_json=spec_json,
-            strategy_hash=sh,
-        )
-
+        run_id_train = db.start_run(exp_id, "train", spec_name, spec_json, sh, fold=fold_id)
         m_train = dict(train.get("metrics", {}) or {})
         train_cached = bool(train.get("cached", False))
         m_train["cached"] = 1.0 if train_cached else 0.0
-
         train_artifacts: Dict[str, Any] = {}
         if train_cached and isinstance(train.get("cache_ref"), dict):
             train_artifacts["cache_info"] = {"cached": True, **train["cache_ref"]}
-
         db.finish_run(
             run_id_train,
             status=str(train.get("status", "error")),
@@ -255,20 +225,10 @@ def run_experiment(cfg: EngineConfig) -> int:
             artifacts=train_artifacts or None,
         )
 
-        # Valid persist
-        run_id_valid = db.start_run(
-            experiment_id=exp_id,
-            split="valid",
-            fold=fold_id,
-            strategy_name=spec_name,
-            strategy_json=spec_json,
-            strategy_hash=sh,
-        )
-
+        run_id_valid = db.start_run(exp_id, "valid", spec_name, spec_json, sh, fold=fold_id)
         m_valid = dict(valid.get("metrics", {}) or {})
         valid_cached = bool(valid.get("cached", False))
         m_valid["cached"] = 1.0 if valid_cached else 0.0
-
         valid_artifacts: Dict[str, Any] = {}
         if valid.get("status") == "ok" and valid.get("artifact") is not None:
             valid_artifacts["equity_curve_head"] = valid["artifact"]
@@ -284,12 +244,8 @@ def run_experiment(cfg: EngineConfig) -> int:
             artifacts=valid_artifacts or None,
         )
 
-        # Aggregate fold compact + selection metric
-        v_metrics = m_valid if valid.get("status") == "ok" else {}
-        t_metrics = m_train if train.get("status") == "ok" else {}
-
-        v_val = float(v_metrics.get(sel_metric, float("nan")))
-        t_val = float(t_metrics.get(sel_metric, float("nan")))
+        v_val = float(m_valid.get(sel_metric, float("nan"))) if valid.get("status") == "ok" else float("nan")
+        t_val = float(m_train.get(sel_metric, float("nan"))) if train.get("status") == "ok" else float("nan")
 
         per_strategy_fold_compact[sh].append(
             {
@@ -304,11 +260,9 @@ def run_experiment(cfg: EngineConfig) -> int:
                 "valid_cached": bool(valid_cached),
             }
         )
-
         if valid.get("status") == "ok" and np.isfinite(v_val):
             per_strategy_valid_vals[sh].append(v_val)
 
-    # CV summary per strategy + ranking
     ranking: List[dict[str, Any]] = []
     for sh, spec in spec_by_hash.items():
         vals = per_strategy_valid_vals.get(sh, [])
@@ -326,14 +280,7 @@ def run_experiment(cfg: EngineConfig) -> int:
             valid_min = float(np.min(arr))
             cv_score = float(valid_agg - float(cfg.research.cv_penalty_std) * valid_std)
 
-        cv_run_id = db.start_run(
-            experiment_id=exp_id,
-            split="cv",
-            fold=None,
-            strategy_name=spec.name,
-            strategy_json=json_by_hash[sh],
-            strategy_hash=sh,
-        )
+        cv_run_id = db.start_run(exp_id, "cv", spec.name, json_by_hash[sh], sh, fold=None)
         db.finish_run(
             cv_run_id,
             status="ok" if np.isfinite(cv_score) else "error",
@@ -352,21 +299,13 @@ def run_experiment(cfg: EngineConfig) -> int:
         )
 
         if np.isfinite(cv_score):
-            ranking.append(
-                {
-                    "strategy_hash": sh,
-                    "strategy_name": spec.name,
-                    "strategy_json": json_by_hash[sh],
-                    "score_value": cv_score,
-                }
-            )
+            ranking.append({"strategy_hash": sh, "strategy_name": spec.name, "strategy_json": json_by_hash[sh], "score_value": cv_score})
 
     ranking.sort(key=lambda r: r["score_value"], reverse=True)
     top_k = min(cfg.research.top_k, len(ranking))
     best = ranking[:top_k]
     db.store_best_candidates(exp_id, ranked=best, score_key="cv_score")
 
-    # Holdout test for best candidates, with cache reuse
     holdout_tasks: List[HoldoutEvalTask] = []
     cached_holdout_results: List[Dict[str, Any]] = []
     cache_test_tasks_skipped = 0
@@ -380,7 +319,7 @@ def run_experiment(cfg: EngineConfig) -> int:
 
             test_ref = db.fetch_cached_run_ref(
                 evaluation_hash=evaluation_hash,
-                code_hash=code_hash,
+                eval_code_hash=eval_code_hash,
                 strategy_hash=sh,
                 split="test",
                 fold=None,
@@ -395,15 +334,7 @@ def run_experiment(cfg: EngineConfig) -> int:
                         "strategy_name": spec.name,
                         "strategy_hash": sh,
                         "strategy_json": json_by_hash[sh],
-                        "test": {
-                            "status": "ok",
-                            "error": None,
-                            "metrics": m_test,
-                            "elapsed_ms": 0,
-                            "artifact": a_test,
-                            "cached": True,
-                            "cache_ref": test_ref,
-                        },
+                        "test": {"status": "ok", "error": None, "metrics": m_test, "elapsed_ms": 0, "artifact": a_test, "cached": True, "cache_ref": test_ref},
                     }
                 )
                 cache_test_tasks_skipped += 1
@@ -438,15 +369,7 @@ def run_experiment(cfg: EngineConfig) -> int:
             spec_json = res["strategy_json"]
             test = res["test"]
 
-            run_id_test = db.start_run(
-                experiment_id=exp_id,
-                split="test",
-                fold=None,
-                strategy_name=spec_name,
-                strategy_json=spec_json,
-                strategy_hash=sh,
-            )
-
+            run_id_test = db.start_run(exp_id, "test", spec_name, spec_json, sh, fold=None)
             m_test = dict(test.get("metrics", {}) or {})
             test_cached = bool(test.get("cached", False))
             m_test["cached"] = 1.0 if test_cached else 0.0
@@ -466,7 +389,6 @@ def run_experiment(cfg: EngineConfig) -> int:
                 artifacts=test_artifacts or None,
             )
 
-    # Finish exec stats (audit: executor + cache + dedup)
     fold_tasks_total = int(n_candidates_unique) * int(n_folds)
     fold_tasks_executed = int(fold_exec_stats.n_tasks)
     fold_tasks_skipped = int(cache_fold_tasks_skipped)
@@ -515,6 +437,7 @@ def run_experiment(cfg: EngineConfig) -> int:
                 "test_tasks_skipped": int(test_tasks_skipped),
                 "cache_key": {
                     "evaluation_hash": evaluation_hash,
+                    "eval_code_hash": eval_code_hash,
                     "config_hash": config_hash,
                     "code_hash": code_hash,
                 },

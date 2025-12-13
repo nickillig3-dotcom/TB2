@@ -20,6 +20,20 @@ def main(argv: list[str] | None = None) -> int:
     best = db.fetch_best_candidates(exp_id)
 
     print(f"experiment_id={exp_id} db={cfg.persistence.db_path}")
+    data_fp = db.fetch_latest_artifact_json(
+        exp_id,
+        split="meta",
+        name="data_fingerprint",
+        strategy_hash="__experiment__",
+    )
+    if isinstance(data_fp, dict):
+        print(
+            "Data:"
+            f" type={data_fp.get('type')}"
+            f" id={data_fp.get('dataset_id')}"
+           f" version={data_fp.get('dataset_version')}"
+            f" method={data_fp.get('version_method')}"
+        )
 
     exec_stats = db.fetch_latest_artifact_json(
         exp_id,

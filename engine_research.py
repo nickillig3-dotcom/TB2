@@ -20,6 +20,7 @@ from engine_tasks import (
     init_eval_context,
 )
 from utils_core import canonical_json, compute_code_hash, set_global_seed
+from engine_datafingerprint import data_fingerprint_from_cfg_data
 
 
 def _load_dataset(cfg: EngineConfig) -> DataSet:
@@ -73,6 +74,8 @@ def run_experiment(cfg: EngineConfig) -> int:
         strategy_json="{}",
         strategy_hash="__experiment__",
     )
+    data_fp = data_fingerprint_from_cfg_data(cfg.data, seed=cfg.seed)
+
     db.finish_run(
         meta_run_id,
         status="ok",
@@ -82,7 +85,10 @@ def run_experiment(cfg: EngineConfig) -> int:
             "has_holdout": float(1.0 if plan.holdout_test is not None else 0.0),
         },
         elapsed_ms=0,
-        artifacts={"cv_plan_meta": plan.meta},
+        artifacts={
+            "cv_plan_meta": plan.meta,
+            "data_fingerprint": data_fp,
+        },
     )
 
     exec_run_id = db.start_run(

@@ -3,33 +3,76 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict
 
+from engine_datafingerprint import infer_dataset_identity_from_data_dict
 from utils_core import stable_hash
-
 
 EVALSIG_SCHEMA = "evalsig_v1"
 
 
+def _as_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, dict):
+        return dict(obj)
+    return dict(getattr(obj, "__dict__", {}) or {})
+
+
+def _drop_none(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove keys with None values (to keep hashes stable when optional fields are added)."""
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            out[k] = _drop_none(v)
+        else:
+            out[k] = v
+    return out
+
+
 def evaluation_signature_from_cfg(cfg: Any) -> Dict[str, Any]:
     """
-    Evaluation signature = only what changes the actual evaluation outcome
-    for a given StrategySpec on a given dataset/split/cost model.
+    Evaluation signature = only what changes evaluation outcome.
 
-    Intentionally excludes:
-      - run_name
-      - mode (light/full)
+    Excludes:
+      - run_name, mode
       - persistence.db_path
-      - execution.n_jobs / prefer_processes
-      - research settings like top_k (selection logic, not evaluation)
+      - execution settings
+      - research selection params (top_k etc.)
 
-    NOTE: For synthetic data, seed changes the generated dataset -> include cfg.seed.
+    For synthetic: signature remains as before (seed injected, no dataset_id/version keys).
+    For non-synthetic: dataset_id + dataset_version are injected (from provided version or file stat).
     """
-    data = asdict(cfg.data) if is_dataclass(getattr(cfg, "data", None)) else dict(getattr(cfg, "data", {}) or {})
-    splits = asdict(cfg.splits) if is_dataclass(getattr(cfg, "splits", None)) else dict(getattr(cfg, "splits", {}) or {})
-    cv = asdict(cfg.cv) if hasattr(cfg, "cv") and is_dataclass(cfg.cv) else dict(getattr(cfg, "cv", {}) or {})
-    backtest = asdict(cfg.backtest) if is_dataclass(getattr(cfg, "backtest", None)) else dict(getattr(cfg, "backtest", {}) or {})
-    costs = asdict(cfg.costs) if is_dataclass(getattr(cfg, "costs", None)) else dict(getattr(cfg, "costs", {}) or {})
+    data = _as_dict(getattr(cfg, "data", None))
+    splits = _as_dict(getattr(cfg, "splits", None))
+    cv = _as_dict(getattr(cfg, "cv", None))
+    backtest = _as_dict(getattr(cfg, "backtest", None))
+    costs = _as_dict(getattr(cfg, "costs", None))
 
-    sig: Dict[str, Any] = {
+    # keep signature stable for synthetic
+    if data.get("type") == "synthetic":
+        if hasattr(cfg, "seed"):
+            data["seed"] = int(getattr(cfg, "seed"))
+    else:
+        # inject dataset identity for real data
+        dataset_id, dataset_version, _ = infer_dataset_identity_from_data_dict(
+            data, seed=int(getattr(cfg, "seed")) if hasattr(cfg, "seed") else None
+        )
+        if not data.get("dataset_id"):
+            data["dataset_id"] = dataset_id
+        if not data.get("dataset_version"):
+            data["dataset_version"] = dataset_version
+
+    # drop None keys to avoid hash churn on optional fields
+    data = _drop_none(data)
+    splits = _drop_none(splits)
+    cv = _drop_none(cv)
+    backtest = _drop_none(backtest)
+    costs = _drop_none(costs)
+
+    return {
         "schema": EVALSIG_SCHEMA,
         "data": data,
         "splits": splits,
@@ -38,24 +81,33 @@ def evaluation_signature_from_cfg(cfg: Any) -> Dict[str, Any]:
         "costs": costs,
     }
 
-    if (data.get("type") == "synthetic") and hasattr(cfg, "seed"):
-        sig["data"]["seed"] = int(getattr(cfg, "seed"))
-
-    return sig
-
 
 def evaluation_signature_from_config_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Same signature, but from persisted experiments.config_json (dict).
-    Used for backfilling evaluation_hash in existing DBs.
-    """
     data = dict(raw.get("data") or {})
     splits = dict(raw.get("splits") or {})
     cv = dict(raw.get("cv") or {})
     backtest = dict(raw.get("backtest") or {})
     costs = dict(raw.get("costs") or {})
 
-    sig: Dict[str, Any] = {
+    if data.get("type") == "synthetic" and "seed" in raw:
+        try:
+            data["seed"] = int(raw["seed"])
+        except Exception:
+            pass
+    else:
+        dataset_id, dataset_version, _ = infer_dataset_identity_from_data_dict(
+            data, seed=int(raw.get("seed")) if isinstance(raw.get("seed"), int) else None
+        )
+        data.setdefault("dataset_id", dataset_id)
+        data.setdefault("dataset_version", dataset_version)
+
+    data = _drop_none(data)
+    splits = _drop_none(splits)
+    cv = _drop_none(cv)
+    backtest = _drop_none(backtest)
+    costs = _drop_none(costs)
+
+    return {
         "schema": EVALSIG_SCHEMA,
         "data": data,
         "splits": splits,
@@ -63,14 +115,6 @@ def evaluation_signature_from_config_dict(raw: Dict[str, Any]) -> Dict[str, Any]
         "backtest": backtest,
         "costs": costs,
     }
-
-    if data.get("type") == "synthetic" and "seed" in raw:
-        try:
-            sig["data"]["seed"] = int(raw["seed"])
-        except Exception:
-            pass
-
-    return sig
 
 
 def evaluation_hash_from_signature(sig: Dict[str, Any]) -> str:

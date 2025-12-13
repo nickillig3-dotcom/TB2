@@ -6,7 +6,7 @@ import numpy as np
 
 from engine_config import EngineConfig
 from engine_cv import CvPlan, build_cv_plan
-from engine_data import DataSet, make_synthetic_dataset
+from engine_data import DataSet, make_synthetic_dataset, load_csv_dataset
 from engine_evalcode import compute_eval_code_hash
 from engine_executor import execute_tasks
 from engine_persistence import SQLitePersistence
@@ -26,6 +26,8 @@ from engine_datafingerprint import data_fingerprint_from_cfg_data
 def _load_dataset(cfg: EngineConfig) -> DataSet:
     if cfg.data.type == "synthetic":
         return make_synthetic_dataset(cfg.data, seed=cfg.seed)
+    if cfg.data.type == "csv":
+        return load_csv_dataset(cfg.data)
     raise ValueError(f"Unknown data.type: {cfg.data.type}")
 
 
@@ -52,6 +54,9 @@ def run_experiment(cfg: EngineConfig) -> int:
     cfg_json = canonical_json(cfg)
     config_hash = cfg.config_hash()
     evaluation_hash = evaluation_hash_from_cfg(cfg)
+    # Compute once, reuse in experiment row + meta artifact
+    data_fp = data_fingerprint_from_cfg_data(cfg.data, seed=cfg.seed)
+
 
     exp_id = db.create_experiment(
         run_name=cfg.run_name,
@@ -61,6 +66,10 @@ def run_experiment(cfg: EngineConfig) -> int:
         evaluation_hash=evaluation_hash,
         eval_code_hash=eval_code_hash,
         code_hash=code_hash,
+        data_type=str(data_fp.get("type", "unknown")),
+        dataset_id=str(data_fp.get("dataset_id", "unknown")),
+        dataset_version=str(data_fp.get("dataset_version", "unknown")),
+        data_fp_hash=str(data_fp.get("fingerprint_hash", "")),
     )
 
     ds = _load_dataset(cfg)
@@ -74,7 +83,6 @@ def run_experiment(cfg: EngineConfig) -> int:
         strategy_json="{}",
         strategy_hash="__experiment__",
     )
-    data_fp = data_fingerprint_from_cfg_data(cfg.data, seed=cfg.seed)
 
     db.finish_run(
         meta_run_id,

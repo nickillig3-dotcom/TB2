@@ -49,3 +49,5 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 *.ipynb_checkpoints
+toy_data.csv
+

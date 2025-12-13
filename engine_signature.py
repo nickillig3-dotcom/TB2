@@ -19,31 +19,67 @@ def _as_dict(obj: Any) -> Dict[str, Any]:
     return dict(getattr(obj, "__dict__", {}) or {})
 
 
-def _drop_none(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove keys with None values (to keep hashes stable when optional fields are added)."""
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        if v is None:
-            continue
-        if isinstance(v, dict):
-            out[k] = _drop_none(v)
-        else:
-            out[k] = v
-    return out
+def _drop_none(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            vv = _drop_none(v)
+            if vv is None:
+                continue
+            out[str(k)] = vv
+        return out
+    if isinstance(obj, list):
+        out_list: list[Any] = []
+        for x in obj:
+            xx = _drop_none(x)
+            if xx is None:
+                continue
+            out_list.append(xx)
+        return out_list
+    return obj
+
+
+def _sanitize_data_for_signature(data: Dict[str, Any], *, seed: int | None) -> Dict[str, Any]:
+    typ = str(data.get("type") or "unknown")
+    d = dict(data)
+
+    if typ == "synthetic":
+        if seed is not None:
+            d["seed"] = int(seed)
+        # keep synthetic params
+        return d
+
+    # Non-synthetic: inject dataset identity (portable) + remove path from signature
+    dataset_id, dataset_version, _method = infer_dataset_identity_from_data_dict(d, seed=None)
+    d["dataset_id"] = dataset_id
+    d["dataset_version"] = dataset_version
+
+    # Path should NOT influence evaluation hash
+    d.pop("path", None)
+
+    # Remove synthetic-only keys that might exist as defaults in DataConfig
+    d.pop("n_rows", None)
+    d.pop("freq", None)
+    d.pop("start", None)
+
+    return d
 
 
 def evaluation_signature_from_cfg(cfg: Any) -> Dict[str, Any]:
     """
-    Evaluation signature = only what changes evaluation outcome.
+    Evaluation signature = only what changes the actual evaluation outcome
+    for a given StrategySpec on a given dataset/split/cost model.
 
-    Excludes:
-      - run_name, mode
+    Intentionally excludes:
+      - run_name
+      - mode (light/full)
       - persistence.db_path
-      - execution settings
-      - research selection params (top_k etc.)
+      - execution settings (threads/processes)
+      - research settings like top_k (selection logic, not evaluation)
 
-    For synthetic: signature remains as before (seed injected, no dataset_id/version keys).
-    For non-synthetic: dataset_id + dataset_version are injected (from provided version or file stat).
+    NOTE:
+      - For synthetic data, cfg.seed changes the dataset -> included.
+      - For file data, dataset_id/version are injected and path is excluded.
     """
     data = _as_dict(getattr(cfg, "data", None))
     splits = _as_dict(getattr(cfg, "splits", None))
@@ -51,28 +87,16 @@ def evaluation_signature_from_cfg(cfg: Any) -> Dict[str, Any]:
     backtest = _as_dict(getattr(cfg, "backtest", None))
     costs = _as_dict(getattr(cfg, "costs", None))
 
-    # keep signature stable for synthetic
-    if data.get("type") == "synthetic":
-        if hasattr(cfg, "seed"):
-            data["seed"] = int(getattr(cfg, "seed"))
-    else:
-        # inject dataset identity for real data
-        dataset_id, dataset_version, _ = infer_dataset_identity_from_data_dict(
-            data, seed=int(getattr(cfg, "seed")) if hasattr(cfg, "seed") else None
-        )
-        if not data.get("dataset_id"):
-            data["dataset_id"] = dataset_id
-        if not data.get("dataset_version"):
-            data["dataset_version"] = dataset_version
+    seed = None
+    if hasattr(cfg, "seed"):
+        try:
+            seed = int(getattr(cfg, "seed"))
+        except Exception:
+            seed = None
 
-    # drop None keys to avoid hash churn on optional fields
-    data = _drop_none(data)
-    splits = _drop_none(splits)
-    cv = _drop_none(cv)
-    backtest = _drop_none(backtest)
-    costs = _drop_none(costs)
+    data = _sanitize_data_for_signature(data, seed=seed)
 
-    return {
+    sig: Dict[str, Any] = {
         "schema": EVALSIG_SCHEMA,
         "data": data,
         "splits": splits,
@@ -80,34 +104,27 @@ def evaluation_signature_from_cfg(cfg: Any) -> Dict[str, Any]:
         "backtest": backtest,
         "costs": costs,
     }
+    return _drop_none(sig)
 
 
 def evaluation_signature_from_config_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Same signature, but from persisted experiments.config_json (dict)."""
     data = dict(raw.get("data") or {})
     splits = dict(raw.get("splits") or {})
     cv = dict(raw.get("cv") or {})
     backtest = dict(raw.get("backtest") or {})
     costs = dict(raw.get("costs") or {})
 
-    if data.get("type") == "synthetic" and "seed" in raw:
+    seed = None
+    if "seed" in raw:
         try:
-            data["seed"] = int(raw["seed"])
+            seed = int(raw["seed"])
         except Exception:
-            pass
-    else:
-        dataset_id, dataset_version, _ = infer_dataset_identity_from_data_dict(
-            data, seed=int(raw.get("seed")) if isinstance(raw.get("seed"), int) else None
-        )
-        data.setdefault("dataset_id", dataset_id)
-        data.setdefault("dataset_version", dataset_version)
+            seed = None
 
-    data = _drop_none(data)
-    splits = _drop_none(splits)
-    cv = _drop_none(cv)
-    backtest = _drop_none(backtest)
-    costs = _drop_none(costs)
+    data = _sanitize_data_for_signature(data, seed=seed)
 
-    return {
+    sig: Dict[str, Any] = {
         "schema": EVALSIG_SCHEMA,
         "data": data,
         "splits": splits,
@@ -115,6 +132,7 @@ def evaluation_signature_from_config_dict(raw: Dict[str, Any]) -> Dict[str, Any]
         "backtest": backtest,
         "costs": costs,
     }
+    return _drop_none(sig)
 
 
 def evaluation_hash_from_signature(sig: Dict[str, Any]) -> str:

@@ -1,0 +1,60 @@
+{
+  "run_name": "strategy_miner_csv",
+  "mode": "light",
+  "seed": 42,
+  "data": {
+    "type": "csv",
+    "path": "toy_data.csv",
+    "timestamp_col": "timestamp",
+    "price_col": "price",
+    "feature_cols": ["feat0", "feat1", "feat2", "feat3", "feat4", "feat5"],
+    "n_features": 6,
+    "row_limit": 400,
+    "dedup": true,
+    "dropna": true,
+    "sep": ",",
+    "dataset_id": "toy_data_v1"
+  },
+  "splits": {
+    "train_frac": 0.6,
+    "valid_frac": 0.2,
+    "embargo_rows": 0,
+    "min_rows": 50
+  },
+  "cv": {
+    "method": "walk_forward",
+    "n_folds": 3,
+    "valid_window_rows": 60,
+    "step_rows": 60,
+    "min_train_rows": 120,
+    "train_window_rows": 0,
+    "purge_rows": 2,
+    "holdout_test_rows": 80,
+    "min_valid_rows": 30
+  },
+  "research": {
+    "n_candidates": 60,
+    "generator": "linear_random_v1",
+    "top_k": 5,
+    "selection_split": "valid",
+    "selection_metric": "sharpe_net",
+    "cv_agg": "median",
+    "cv_penalty_std": 0.5
+  },
+  "backtest": {
+    "execution_lag": 1,
+    "leverage": 1.0
+  },
+  "costs": {
+    "tc_bps": 2.0,
+    "slippage_bps": 1.0,
+    "borrow_bps_annual": 0.0
+  },
+  "persistence": {
+    "db_path": "strategy_miner.sqlite"
+  },
+  "execution": {
+    "n_jobs": 2,
+    "prefer_processes": false
+  }
+}

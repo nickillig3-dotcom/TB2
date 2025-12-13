@@ -1,19 +1,126 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import asdict, dataclass
+from typing import Any, Optional
 
 from utils_core import stable_hash
 
 
+def _drop_none(obj: Any) -> Any:
+    """Recursively drop None values from dict/list structures (keeps empty lists/dicts)."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            vv = _drop_none(v)
+            if vv is None:
+                continue
+            out[str(k)] = vv
+        return out
+    if isinstance(obj, list):
+        out_list: list[Any] = []
+        for x in obj:
+            xx = _drop_none(x)
+            if xx is None:
+                continue
+            out_list.append(xx)
+        return out_list
+    return obj
+
+
+def _coerce_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _coerce_int_opt(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _coerce_float(x: Any, default: float) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _coerce_str_opt(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
+
+def _coerce_bool_opt(x: Any) -> Optional[bool]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(int(x))
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _coerce_str_list_opt(x: Any) -> Optional[list[str]]:
+    if x is None:
+        return None
+    if isinstance(x, list):
+        out: list[str] = []
+        for it in x:
+            s = _coerce_str_opt(it)
+            if s:
+                out.append(s)
+        return out or None
+    if isinstance(x, str):
+        parts = [p.strip() for p in x.split(",")]
+        parts = [p for p in parts if p]
+        return parts or None
+    return None
+
+
+def _get(d: dict[str, Any], key: str, default: Any) -> Any:
+    v = d.get(key, default)
+    return default if v is None else v
+
+
 @dataclass(frozen=True)
 class DataConfig:
+    # core selector
     type: str = "synthetic"
+
+    # synthetic generator params
     n_rows: int = 400
     n_features: int = 6
     freq: str = "D"
     start: str = "2018-01-01"
+
+    # identity overrides (optional)
+    dataset_id: Optional[str] = None
+    dataset_version: Optional[str] = None
+
+    # file/csv params (optional)
+    path: Optional[str] = None
+    timestamp_col: Optional[str] = None
+    price_col: Optional[str] = None
+    feature_cols: Optional[list[str]] = None
+    tz: Optional[str] = None
+    row_limit: Optional[int] = None
+    dropna: Optional[bool] = None
+    dedup: Optional[bool] = None
+    sep: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -26,29 +133,27 @@ class SplitConfig:
 
 @dataclass(frozen=True)
 class CvConfig:
-    """Cross-validation / robustness split config.
+    """
+    Cross-validation / robustness split config.
 
     method:
       - "single": use SplitConfig's single train/valid/test split
       - "walk_forward": multiple chronological folds + final holdout test
 
     purge_rows:
-      - removes last N rows from training before each validation window
-        (purged boundary to reduce leakage risk).
+      - removes last N rows from training before each validation window (purged boundary)
 
     holdout_test_rows:
-      - reserves final untouched OOS test slice.
+      - reserves final untouched OOS test slice
     """
+
     method: str = "single"  # single|walk_forward
     n_folds: int = 3
-
     valid_window_rows: int = 50
     step_rows: int = 50
-
     min_train_rows: int = 120
     train_window_rows: int = 0  # 0 => expanding window, else fixed rolling window
     purge_rows: int = 2
-
     holdout_test_rows: int = 80
     min_valid_rows: int = 30
 
@@ -106,26 +211,8 @@ class EngineConfig:
     execution: ExecutionConfig = ExecutionConfig()
 
     def config_hash(self) -> str:
-        return stable_hash(self)
-
-
-def _coerce_int(x: Any, default: int) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def _coerce_float(x: Any, default: float) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _get(d: dict[str, Any], key: str, default: Any) -> Any:
-    v = d.get(key, default)
-    return default if v is None else v
+        # Important: drop None so schema extensions don't invalidate old hashes.
+        return stable_hash(_drop_none(asdict(self)))
 
 
 def load_config(path: str) -> EngineConfig:
@@ -152,6 +239,17 @@ def load_config(path: str) -> EngineConfig:
             n_features=_coerce_int(_get(data_raw, "n_features", 6), 6),
             freq=str(_get(data_raw, "freq", "D")),
             start=str(_get(data_raw, "start", "2018-01-01")),
+            dataset_id=_coerce_str_opt(_get(data_raw, "dataset_id", None)),
+            dataset_version=_coerce_str_opt(_get(data_raw, "dataset_version", None)),
+            path=_coerce_str_opt(_get(data_raw, "path", None)),
+            timestamp_col=_coerce_str_opt(_get(data_raw, "timestamp_col", None)),
+            price_col=_coerce_str_opt(_get(data_raw, "price_col", None)),
+            feature_cols=_coerce_str_list_opt(_get(data_raw, "feature_cols", None)),
+            tz=_coerce_str_opt(_get(data_raw, "tz", None)),
+            row_limit=_coerce_int_opt(_get(data_raw, "row_limit", None)),
+            dropna=_coerce_bool_opt(_get(data_raw, "dropna", None)),
+            dedup=_coerce_bool_opt(_get(data_raw, "dedup", None)),
+            sep=_coerce_str_opt(_get(data_raw, "sep", None)),
         ),
         splits=SplitConfig(
             train_frac=_coerce_float(_get(splits_raw, "train_frac", 0.6), 0.6),
@@ -197,23 +295,30 @@ def load_config(path: str) -> EngineConfig:
         ),
     )
 
-    # Minimal sanity checks
+    # --- Sanity checks ---
     if not (0.0 < cfg.splits.train_frac < 1.0):
         raise ValueError("splits.train_frac must be in (0,1)")
     if not (0.0 <= cfg.splits.valid_frac < 1.0):
         raise ValueError("splits.valid_frac must be in [0,1)")
     if cfg.splits.train_frac + cfg.splits.valid_frac >= 1.0:
         raise ValueError("train_frac + valid_frac must be < 1.0")
+
     if cfg.backtest.execution_lag < 0:
         raise ValueError("backtest.execution_lag must be >= 0")
     if cfg.research.n_candidates <= 0:
         raise ValueError("research.n_candidates must be > 0")
-    if cfg.data.n_rows <= 10:
-        raise ValueError("data.n_rows must be > 10")
-    if cfg.data.n_features <= 0:
-        raise ValueError("data.n_features must be > 0")
     if cfg.research.top_k <= 0:
         raise ValueError("research.top_k must be > 0")
+
+    if cfg.data.n_features <= 0:
+        raise ValueError("data.n_features must be > 0")
+
+    if cfg.data.type == "synthetic":
+        if cfg.data.n_rows <= 10:
+            raise ValueError("data.n_rows must be > 10 for synthetic")
+    elif cfg.data.type == "csv":
+        if not cfg.data.path:
+            raise ValueError("data.path is required for data.type='csv'")
 
     if cfg.cv.method not in {"single", "walk_forward"}:
         raise ValueError("cv.method must be 'single' or 'walk_forward'")
@@ -229,7 +334,6 @@ def load_config(path: str) -> EngineConfig:
         raise ValueError("cv.purge_rows must be >= 0")
     if cfg.cv.train_window_rows < 0:
         raise ValueError("cv.train_window_rows must be >= 0")
-
     if cfg.research.cv_agg not in {"median", "mean", "min"}:
         raise ValueError("research.cv_agg must be one of: median|mean|min")
     if cfg.research.cv_penalty_std < 0:

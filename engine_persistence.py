@@ -6,7 +6,7 @@ import zlib
 from typing import Any, Dict, Optional
 
 from engine_signature import evaluation_hash_from_signature, evaluation_signature_from_config_dict
-from utils_core import canonical_json, env_fingerprint, now_utc_iso
+from utils_core import canonical_json, env_fingerprint, now_utc_iso, stable_hash
 
 
 class SQLitePersistence:
@@ -50,6 +50,13 @@ class SQLitePersistence:
                 evaluation_hash TEXT,
                 eval_code_hash TEXT,
                 code_hash TEXT NOT NULL,
+
+                -- dataset metadata (indexable)
+                data_type TEXT,
+                dataset_id TEXT,
+                dataset_version TEXT,
+                data_fp_hash TEXT,
+
                 python TEXT NOT NULL,
                 platform TEXT NOT NULL
             );
@@ -142,6 +149,14 @@ class SQLitePersistence:
                 "CREATE INDEX IF NOT EXISTS idx_experiments_eval_evalcode ON experiments(evaluation_hash, eval_code_hash);"
             )
 
+        if self._column_exists("experiments", "dataset_id") and self._column_exists("experiments", "dataset_version"):
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_experiments_dataset ON experiments(dataset_id, dataset_version);"
+            )
+
+        if self._column_exists("experiments", "dataset_id"):
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_dataset_id ON experiments(dataset_id);")
+
         # runs indexes
         if self._column_exists("runs", "experiment_id") and self._column_exists("runs", "split"):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_experiment_split ON runs(experiment_id, split);")
@@ -166,6 +181,40 @@ class SQLitePersistence:
 
         self.conn.commit()
 
+    def _fetch_meta_data_fingerprint(self, experiment_id: int) -> Optional[dict[str, Any]]:
+        """
+        Best-effort: read meta/data_fingerprint artifact for an experiment.
+        Returns parsed JSON dict or None.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT a.content, a.compression
+            FROM runs r
+            JOIN artifacts a ON a.run_id = r.run_id
+            WHERE r.experiment_id = ?
+              AND r.split = 'meta'
+              AND r.strategy_hash = '__experiment__'
+              AND a.name = 'data_fingerprint'
+            ORDER BY r.run_id DESC
+            LIMIT 1
+            """,
+            (int(experiment_id),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        blob = row["content"]
+        if row["compression"] == "zlib":
+            blob = zlib.decompress(blob)
+
+        try:
+            obj = json.loads(blob.decode("utf-8"))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
     def _migrate_schema(self) -> None:
         """Forward-only tiny migrations for local dev."""
         cur = self.conn.cursor()
@@ -181,6 +230,16 @@ class SQLitePersistence:
         # v4: experiments.eval_code_hash
         if not self._column_exists("experiments", "eval_code_hash"):
             cur.execute("ALTER TABLE experiments ADD COLUMN eval_code_hash TEXT;")
+
+        # v5: dataset metadata columns
+        if not self._column_exists("experiments", "data_type"):
+            cur.execute("ALTER TABLE experiments ADD COLUMN data_type TEXT;")
+        if not self._column_exists("experiments", "dataset_id"):
+            cur.execute("ALTER TABLE experiments ADD COLUMN dataset_id TEXT;")
+        if not self._column_exists("experiments", "dataset_version"):
+            cur.execute("ALTER TABLE experiments ADD COLUMN dataset_version TEXT;")
+        if not self._column_exists("experiments", "data_fp_hash"):
+            cur.execute("ALTER TABLE experiments ADD COLUMN data_fp_hash TEXT;")
 
         self.conn.commit()
 
@@ -221,6 +280,68 @@ class SQLitePersistence:
             )
             self.conn.commit()
 
+        # Backfill dataset metadata (prefer meta artifact; fallback to config_json best-effort)
+        if (
+            self._column_exists("experiments", "dataset_id")
+            and self._column_exists("experiments", "dataset_version")
+            and self._column_exists("experiments", "data_type")
+            and self._column_exists("experiments", "data_fp_hash")
+        ):
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT experiment_id, config_json, data_type, dataset_id, dataset_version, data_fp_hash
+                FROM experiments
+                WHERE dataset_id IS NULL OR dataset_id = ''
+                   OR dataset_version IS NULL OR dataset_version = ''
+                   OR data_type IS NULL OR data_type = ''
+                   OR data_fp_hash IS NULL OR data_fp_hash = ''
+                """
+            )
+            rows = cur.fetchall()
+            if rows:
+                for r in rows:
+                    exp_id = int(r["experiment_id"])
+                    fp = self._fetch_meta_data_fingerprint(exp_id)
+
+                    if isinstance(fp, dict):
+                        data_type = fp.get("type") or "unknown"
+                        dataset_id = fp.get("dataset_id") or "unknown"
+                        dataset_version = fp.get("dataset_version") or "unknown"
+                        data_fp_hash = fp.get("fingerprint_hash") or stable_hash(fp)
+                    else:
+                        # fallback: parse config_json
+                        try:
+                            raw = json.loads(r["config_json"])
+                            data = dict(raw.get("data") or {})
+                            data_type = str(data.get("type") or "unknown")
+
+                            # If user provided dataset fields in config, use them
+                            dataset_id = str(data.get("dataset_id") or (data.get("path") or data_type))
+                            dataset_version = str(data.get("dataset_version") or "unknown")
+
+                            # best-effort stable hash for identifying that we backfilled
+                            data_fp_hash = stable_hash(
+                                {
+                                    "schema": "datafp_backfill_v1",
+                                    "type": data_type,
+                                    "dataset_id": dataset_id,
+                                    "dataset_version": dataset_version,
+                                }
+                            )
+                        except Exception:
+                            continue
+
+                    cur.execute(
+                        """
+                        UPDATE experiments
+                        SET data_type = ?, dataset_id = ?, dataset_version = ?, data_fp_hash = ?
+                        WHERE experiment_id = ?
+                        """,
+                        (str(data_type), str(dataset_id), str(dataset_version), str(data_fp_hash), exp_id),
+                    )
+                self.conn.commit()
+
         # Finally: create indexes safely
         self._ensure_indexes()
 
@@ -233,13 +354,22 @@ class SQLitePersistence:
         evaluation_hash: str,
         eval_code_hash: str,
         code_hash: str,
+        data_type: str,
+        dataset_id: str,
+        dataset_version: str,
+        data_fp_hash: str,
     ) -> int:
         env = env_fingerprint()
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO experiments(created_at, run_name, mode, config_json, config_hash, evaluation_hash, eval_code_hash, code_hash, python, platform)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO experiments(
+                created_at, run_name, mode, config_json, config_hash,
+                evaluation_hash, eval_code_hash, code_hash,
+                data_type, dataset_id, dataset_version, data_fp_hash,
+                python, platform
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_utc_iso(),
@@ -250,6 +380,10 @@ class SQLitePersistence:
                 evaluation_hash,
                 eval_code_hash,
                 code_hash,
+                data_type,
+                dataset_id,
+                dataset_version,
+                data_fp_hash,
                 env["python"],
                 env["platform"],
             ),

@@ -1,0 +1,36 @@
+{
+  "run_name": "smoke_walkforward_threads_psr",
+  "mode": "light",
+  "seed": 42,
+  "data": {
+    "type": "synthetic",
+    "n_rows": 400,
+    "n_features": 6,
+    "freq": "D",
+    "start": "2018-01-01"
+  },
+  "cv": {
+    "method": "walk_forward",
+    "n_folds": 3,
+    "valid_window_rows": 50,
+    "step_rows": 50,
+    "min_train_rows": 120,
+    "train_window_rows": 0,
+    "purge_rows": 2,
+    "holdout_test_rows": 80,
+    "min_valid_rows": 30
+  },
+  "research": {
+    "n_candidates": 60,
+    "generator": "linear_random_v1",
+    "top_k": 5,
+    "selection_split": "valid",
+    "selection_metric": "psr_net",
+    "cv_agg": "median",
+    "cv_penalty_std": 0.5
+  },
+  "execution": {
+    "n_jobs": 4,
+    "prefer_processes": false
+  }
+}

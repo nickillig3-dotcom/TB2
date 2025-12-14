@@ -97,12 +97,24 @@ def main(argv: list[str] | None = None) -> int:
         # Show the actual selection metric aggregate stored in CV split metrics
         cv_sel = db.fetch_latest_metric_for_strategy(exp_id, sh, split="cv", metric_key=cv_key)
 
+        # Overfitting diagnostics (train vs valid on the same selection metric)
+        gap_key = f"{sel_metric}_train_valid_gap_{cfg.research.cv_agg}"
+        cv_gap = db.fetch_latest_metric_for_strategy(exp_id, sh, split="cv", metric_key=gap_key)
+        cv_std = db.fetch_latest_metric_for_strategy(exp_id, sh, split="cv", metric_key=f"{sel_metric}_valid_std")
+        cv_ovf = db.fetch_latest_metric_for_strategy(exp_id, sh, split="cv", metric_key=f"{sel_metric}_train_gt_valid_frac")
+
         # Always show test sharpe for interpretability (if test exists)
         test_sharpe = db.fetch_latest_metric_for_strategy(exp_id, sh, split="test", metric_key="sharpe_net")
 
         extra_parts: list[str] = []
         if cv_sel is not None:
             extra_parts.append(f"cv_{cv_key}={cv_sel:.4f}")
+        if cv_gap is not None and cv_gap == cv_gap:
+            extra_parts.append(f"cv_gap={cv_gap:.4f}")
+        if cv_std is not None and cv_std == cv_std:
+            extra_parts.append(f"cv_std={cv_std:.4f}")
+        if cv_ovf is not None and cv_ovf == cv_ovf:
+            extra_parts.append(f"cv_train>valid={cv_ovf:.2f}")
 
         # Selection metric on test: special case for DSR (virtual)
         if sel_metric == "dsr_net":

@@ -351,6 +351,7 @@ def run_experiment(cfg: EngineConfig) -> int:
     fold_results.extend(fold_results_computed)
 
     per_strategy_valid_vals: Dict[str, List[float]] = {sh: [] for sh in spec_by_hash.keys()}
+    per_strategy_train_vals: Dict[str, List[float]] = {sh: [] for sh in spec_by_hash.keys()}
     per_strategy_fold_compact: Dict[str, List[Dict[str, Any]]] = {sh: [] for sh in spec_by_hash.keys()}
 
     for res in fold_results:
@@ -431,17 +432,65 @@ def run_experiment(cfg: EngineConfig) -> int:
     for sh, spec in spec_by_hash.items():
         vals = per_strategy_valid_vals.get(sh, [])
         complete = len(vals) == n_folds
+        valid_vals = per_strategy_valid_vals.get(sh, [])
+        train_vals = per_strategy_train_vals.get(sh, [])
+        complete = len(valid_vals) == n_folds
 
         cv_score = float("nan")
         valid_agg = float("nan")
         valid_std = float("nan")
         valid_min = float("nan")
 
-        if complete and len(vals) > 0:
-            arr = np.asarray(vals, dtype=float)
-            valid_agg = _agg(vals, cfg.research.cv_agg)
-            valid_std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-            valid_min = float(np.min(arr))
+        train_agg = float("nan")
+        train_std = float("nan")
+        train_min = float("nan")
+
+        train_valid_gap = float("nan")
+        train_valid_corr = float("nan")
+        train_gt_valid_frac = float("nan")
+        train_valid_n_pairs = 0
+
+        if complete and len(valid_vals) > 0:
+            v_arr = np.asarray(valid_vals, dtype=float)
+            valid_agg = _agg(valid_vals, cfg.research.cv_agg)
+            valid_std = float(np.std(v_arr, ddof=1)) if v_arr.size > 1 else 0.0
+            valid_min = float(np.min(v_arr))
+
+            # Train side diagnostics (same selection metric on train split)
+            if len(train_vals) > 0:
+                t_arr = np.asarray(train_vals, dtype=float)
+                train_agg = _agg(train_vals, cfg.research.cv_agg)
+                train_std = float(np.std(t_arr, ddof=1)) if t_arr.size > 1 else 0.0
+                train_min = float(np.min(t_arr))
+
+            # Overfit diagnostics from fold pairs (finite train+valid)
+            pairs: list[tuple[float, float]] = []
+            for fc in per_strategy_fold_compact.get(sh, []):
+                t = float(fc.get("train_metric", float("nan")))
+                v = float(fc.get("valid_metric", float("nan")))
+                if np.isfinite(t) and np.isfinite(v):
+                    pairs.append((t, v))
+
+            train_valid_n_pairs = len(pairs)
+            if train_valid_n_pairs > 0:
+                tt = np.asarray([p[0] for p in pairs], dtype=float)
+                vv = np.asarray([p[1] for p in pairs], dtype=float)
+
+                # fraction of folds where train > valid (simple overfit indicator)
+                train_gt_valid_frac = float(np.mean((tt > vv).astype(float)))
+
+                # correlation train vs valid across folds
+                if train_valid_n_pairs >= 2:
+                    try:
+                        c = np.corrcoef(tt, vv)[0, 1]
+                        train_valid_corr = float(c)
+                    except Exception:
+                        train_valid_corr = float("nan")
+
+            if np.isfinite(train_agg) and np.isfinite(valid_agg):
+                train_valid_gap = float(train_agg - valid_agg)
+
+            # Base CV score (existing behavior)
             cv_score = float(valid_agg - float(cfg.research.cv_penalty_std) * valid_std)
 
         cv_run_id = db.start_run(exp_id, "cv", spec.name, json_by_hash[sh], sh, fold=None)
@@ -449,11 +498,18 @@ def run_experiment(cfg: EngineConfig) -> int:
         metrics_cv: Dict[str, float] = {
             "cv_score": float(cv_score) if np.isfinite(cv_score) else float("nan"),
             "cv_complete": float(1.0 if complete else 0.0),
-            "cv_n_folds_ok": float(len(vals)),
+            "cv_n_folds_ok": float(len(valid_vals)),
             "cv_n_folds_total": float(n_folds),
             f"{sel_metric}_valid_{cfg.research.cv_agg}": float(valid_agg),
             f"{sel_metric}_valid_std": float(valid_std),
             f"{sel_metric}_valid_min": float(valid_min),
+            f"{sel_metric}_train_{cfg.research.cv_agg}": float(train_agg),
+            f"{sel_metric}_train_std": float(train_std),
+            f"{sel_metric}_train_min": float(train_min),
+            f"{sel_metric}_train_valid_gap_{cfg.research.cv_agg}": float(train_valid_gap),
+            f"{sel_metric}_train_gt_valid_frac": float(train_gt_valid_frac),
+            f"{sel_metric}_train_valid_corr": float(train_valid_corr),
+            f"{sel_metric}_train_valid_n_pairs": float(train_valid_n_pairs),
         }
         if sel_metric == "dsr_net":
             metrics_cv["dsr_trials"] = float(dsr_trials)
@@ -461,7 +517,7 @@ def run_experiment(cfg: EngineConfig) -> int:
         db.finish_run(
             cv_run_id,
             status="ok" if np.isfinite(cv_score) else "error",
-            error=None if np.isfinite(cv_score) else f"incomplete_valid_folds ok={len(vals)} total={n_folds}",
+            error=None if np.isfinite(cv_score) else f"incomplete_valid_folds ok={len(valid_vals)} total={n_folds}",
             metrics=metrics_cv,
             elapsed_ms=0,
             artifacts={"cv_folds_compact": per_strategy_fold_compact.get(sh, [])},

@@ -522,7 +522,18 @@ class SQLitePersistence:
             (int(experiment_id), str(strategy_hash), str(split), str(metric_key)),
         )
         row = cur.fetchone()
-        return None if row is None else float(row["value"])
+        if row is None:
+            return None
+
+        v = row["value"]
+        if v is None:
+            return None
+
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
 
     def fetch_latest_artifact_json(
         self,

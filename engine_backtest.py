@@ -13,6 +13,7 @@ from utils_core import ensure_monotonic_datetime_index, infer_periods_per_year
 class BacktestResult:
     net_returns: pd.Series
     gross_returns: pd.Series
+    asset_returns: pd.Series  # <- NEW: market/underlying returns from price
     positions: pd.Series
     turnover: pd.Series
     cost_components: Dict[str, pd.Series]
@@ -26,7 +27,8 @@ def run_backtest(
     bt_cfg: BacktestConfig,
     cost_cfg: CostConfig,
 ) -> BacktestResult:
-    """Vectorized single-instrument backtest with basic cost model.
+    """
+    Vectorized single-instrument backtest with basic cost model.
 
     Assumptions:
       - 'price' column exists
@@ -51,13 +53,13 @@ def run_backtest(
     lag = int(bt_cfg.execution_lag)
     if lag < 0:
         raise ValueError("execution_lag must be >= 0")
-
     positions = raw_positions.shift(lag).fillna(0.0) * float(bt_cfg.leverage)
 
-    # Returns
-    ret = price.pct_change().fillna(0.0)
+    # Underlying/asset returns from price (exogenous market series)
+    asset_ret = price.pct_change().fillna(0.0)
 
-    gross = positions * ret
+    # Strategy gross returns
+    gross = positions * asset_ret
 
     # Turnover = absolute position change (proxy for traded notional)
     turnover = positions.diff().abs()
@@ -74,13 +76,13 @@ def run_backtest(
     borrow = positions.abs() * borrow_per_period
 
     net = gross - tc - slip - borrow
-
     equity = (1.0 + net).cumprod()
     equity.name = "equity"
 
     return BacktestResult(
         net_returns=net.rename("ret_net"),
         gross_returns=gross.rename("ret_gross"),
+        asset_returns=asset_ret.rename("ret_asset"),
         positions=positions.rename("pos_exec"),
         turnover=turnover.rename("turnover"),
         cost_components={

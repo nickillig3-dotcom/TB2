@@ -413,15 +413,27 @@ def compute_metrics(bt: BacktestResult) -> Dict[str, float]:
     }
 
     # ---- Regime Robustness (market-driven proxy if possible) ----
-    ref_src, coverage = _infer_reference_returns_from_bt(g, pos, eps_pos=1e-6)
+    # ---- Regime Robustness (market-driven, strategy-independent if possible) ----
+    # Prefer true underlying returns from backtest (price.pct_change()) if available.
+    use_ref = False
+    coverage = 0.0
 
-    # Use inferred reference only if it covers most points AND has non-trivial variance.
-    use_ref = (coverage >= 0.90) and (np.isfinite(ref_src).all()) and (float(np.std(ref_src)) > 1e-12)
+    asset = getattr(bt, "asset_returns", None)
+    if asset is not None:
+        src_asset = asset.to_numpy(dtype=float)
+        coverage = float(np.mean(np.isfinite(src_asset))) if src_asset.size else 0.0
+        # asset_returns should be fully finite and non-trivial in variance
+        use_ref = (coverage >= 0.99) and (float(np.std(src_asset)) > 1e-12)
+        src = src_asset if use_ref else r
+    else:
+        # Fallback (older DB / older code paths)
+        ref_src, coverage = _infer_reference_returns_from_bt(g, pos, eps_pos=1e-6)
+        use_ref = (coverage >= 0.90) and (np.isfinite(ref_src).all()) and (float(np.std(ref_src)) > 1e-12)
+        src = ref_src if use_ref else r
 
     metrics["regime_ref_used"] = safe_float(1.0 if use_ref else 0.0)
     metrics["regime_ref_coverage"] = safe_float(coverage)
 
-    src = ref_src if use_ref else r
 
     reg = _regime_metrics(
         strategy_returns=r,
